@@ -4,15 +4,36 @@ import type { ITag } from '@n8n/rest-api-client/api/tags';
 import { defineStore } from 'pinia';
 import { useRootStore } from '@n8n/stores/useRootStore';
 import { computed, ref } from 'vue';
-import { useWorkflowsStore } from '@/app/stores/workflows.store';
+import { hasPermission } from '@/app/utils/rbac/permissions';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
+import type { Scope } from '@n8n/permissions';
 
 const apiMapping = {
 	[STORES.TAGS]: createTagsApi('/tags'),
 	[STORES.ANNOTATION_TAGS]: createTagsApi('/annotation-tags'),
 } as const;
 
+const scopeMapping: Record<
+	typeof STORES.TAGS | typeof STORES.ANNOTATION_TAGS,
+	{ list: Scope; create: Scope; update: Scope; delete: Scope }
+> = {
+	[STORES.TAGS]: {
+		list: 'tag:list',
+		create: 'tag:create',
+		update: 'tag:update',
+		delete: 'tag:delete',
+	},
+	[STORES.ANNOTATION_TAGS]: {
+		list: 'annotationTag:list',
+		create: 'annotationTag:create',
+		update: 'annotationTag:update',
+		delete: 'annotationTag:delete',
+	},
+};
+
 const createTagsStore = (id: typeof STORES.TAGS | typeof STORES.ANNOTATION_TAGS) => {
 	const tagsApi = apiMapping[id];
+	const scopes = scopeMapping[id];
 
 	return defineStore(
 		id,
@@ -23,7 +44,7 @@ const createTagsStore = (id: typeof STORES.TAGS | typeof STORES.ANNOTATION_TAGS)
 			const fetchedUsageCount = ref(false);
 
 			const rootStore = useRootStore();
-			const workflowsStore = useWorkflowsStore();
+			const workflowDocumentStore = injectWorkflowDocumentStore();
 
 			// Computed
 
@@ -74,24 +95,35 @@ const createTagsStore = (id: typeof STORES.TAGS | typeof STORES.ANNOTATION_TAGS)
 			};
 
 			const fetchAll = async (params?: { force?: boolean; withUsageCount?: boolean }) => {
-				const { force = false, withUsageCount = false } = params || {};
+				if (!hasPermission(['rbac'], { rbac: { scope: scopes.list } })) {
+					return [];
+				}
+
+				const { force = false, withUsageCount = false } = params ?? {};
 				if (!force && fetchedAll.value && fetchedUsageCount.value === withUsageCount) {
 					return Object.values(tagsById.value);
 				}
 
 				loading.value = true;
-				const retrievedTags = await tagsApi.getTags(rootStore.restApiContext, {
-					withUsageCount,
-				});
-				setAllTags(retrievedTags);
-				loading.value = false;
-				return retrievedTags;
+				try {
+					const retrievedTags = await tagsApi.getTags(rootStore.restApiContext, {
+						withUsageCount,
+					});
+					setAllTags(retrievedTags);
+					return retrievedTags;
+				} finally {
+					loading.value = false;
+				}
 			};
 
 			const create = async (
 				name: string,
 				{ incrementExisting }: { incrementExisting?: boolean } = {},
 			) => {
+				if (!hasPermission(['rbac'], { rbac: { scope: scopes.create } })) {
+					throw new Error('Insufficient permissions to create tags');
+				}
+
 				let tagName = name;
 
 				if (incrementExisting) {
@@ -108,17 +140,25 @@ const createTagsStore = (id: typeof STORES.TAGS | typeof STORES.ANNOTATION_TAGS)
 			};
 
 			const rename = async ({ id, name }: { id: string; name: string }) => {
+				if (!hasPermission(['rbac'], { rbac: { scope: scopes.update } })) {
+					throw new Error('Insufficient permissions to update tags');
+				}
+
 				const updatedTag = await tagsApi.updateTag(rootStore.restApiContext, id, { name });
 				upsertTags([updatedTag]);
 				return updatedTag;
 			};
 
 			const deleteTagById = async (id: string) => {
+				if (!hasPermission(['rbac'], { rbac: { scope: scopes.delete } })) {
+					throw new Error('Insufficient permissions to delete tags');
+				}
+
 				const deleted = await tagsApi.deleteTag(rootStore.restApiContext, id);
 
 				if (deleted) {
 					deleteTag(id);
-					workflowsStore.removeWorkflowTagId(id);
+					workflowDocumentStore.value.removeTag(id);
 				}
 
 				return deleted;

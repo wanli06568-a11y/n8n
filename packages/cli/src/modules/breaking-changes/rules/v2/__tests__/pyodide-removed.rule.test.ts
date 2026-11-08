@@ -6,7 +6,7 @@ describe('PyodideRemovedRule', () => {
 	let rule: PyodideRemovedRule;
 
 	beforeEach(() => {
-		jest.clearAllMocks();
+		vi.clearAllMocks();
 		rule = new PyodideRemovedRule();
 	});
 
@@ -20,7 +20,7 @@ describe('PyodideRemovedRule', () => {
 				description:
 					'The Pyodide-based Python implementation in the Code node has been removed and replaced with a native Python task runner implementation',
 				category: BreakingChangeCategory.workflow,
-				severity: 'medium',
+				impact: 'executionsFail',
 			});
 		});
 	});
@@ -39,7 +39,7 @@ describe('PyodideRemovedRule', () => {
 				{
 					action: 'Review and adjust Python scripts',
 					description:
-						'Review Code node scripts relying on Pyodide syntax and adjust for breaking changes. See: https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.code/#python-native-beta',
+						'Review Code node scripts relying on Pyodide syntax and adjust for breaking changes. See: https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.code/#python-native',
 				},
 				{
 					action: 'Set up Python task runner',
@@ -168,6 +168,73 @@ describe('PyodideRemovedRule', () => {
 			expect(result.isAffected).toBe(true);
 			expect(result.issues).toHaveLength(1);
 			expect(result.issues[0].nodeName).toBe('Python');
+		});
+
+		it('should return no issues when Code Tool nodes use native Python (pythonNative)', async () => {
+			const { workflow, nodesGroupedByType } = createWorkflow('wf-1', 'Test Workflow', [
+				createNode('Code Tool', '@n8n/n8n-nodes-langchain.toolCode', {
+					language: 'pythonNative',
+					pythonCode: 'print("hello")',
+				}),
+			]);
+			const result = await rule.detectWorkflow(workflow, nodesGroupedByType);
+
+			expect(result).toEqual({
+				isAffected: false,
+				issues: [],
+			});
+		});
+
+		it('should detect Code Tool node with Pyodide Python (language="python")', async () => {
+			const { workflow, nodesGroupedByType } = createWorkflow('wf-1', 'Test Workflow', [
+				createNode('Code Tool', '@n8n/n8n-nodes-langchain.toolCode', {
+					language: 'python',
+					pythonCode: 'print("hello")',
+				}),
+			]);
+
+			const result = await rule.detectWorkflow(workflow, nodesGroupedByType);
+
+			expect(result.isAffected).toBe(true);
+			expect(result.issues).toHaveLength(1);
+			expect(result.issues[0]).toMatchObject({
+				title: "Code node 'Code Tool' uses removed Pyodide Python implementation",
+				description:
+					'The Pyodide-based Python implementation (language="python") is no longer supported. This node must be migrated to use the task runner-based implementation (language="pythonNative").',
+				level: 'error',
+				nodeId: expect.any(String),
+				nodeName: 'Code Tool',
+			});
+		});
+
+		it('should detect both Code and Code Tool nodes with Pyodide Python', async () => {
+			const { workflow, nodesGroupedByType } = createWorkflow('wf-1', 'Test Workflow', [
+				createNode('Python Code', 'n8n-nodes-base.code', {
+					language: 'python',
+					pythonCode: 'print("hello")',
+				}),
+				createNode('Python Tool', '@n8n/n8n-nodes-langchain.toolCode', {
+					language: 'python',
+					pythonCode: 'print("world")',
+				}),
+			]);
+
+			const result = await rule.detectWorkflow(workflow, nodesGroupedByType);
+
+			expect(result.isAffected).toBe(true);
+			expect(result.issues).toHaveLength(2);
+			expect(result.issues).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						nodeName: 'Python Code',
+						title: "Code node 'Python Code' uses removed Pyodide Python implementation",
+					}),
+					expect.objectContaining({
+						nodeName: 'Python Tool',
+						title: "Code node 'Python Tool' uses removed Pyodide Python implementation",
+					}),
+				]),
+			);
 		});
 	});
 });

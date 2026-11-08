@@ -1,20 +1,26 @@
 import { randomValidPassword, uniqueId, testDb, mockInstance } from '@n8n/backend-test-utils';
+import { InstanceSettingsLoaderConfig } from '@n8n/config';
 import { LICENSE_FEATURES } from '@n8n/constants';
 import { SettingsRepository, UserRepository, type User } from '@n8n/db';
 import { Container } from '@n8n/di';
 import { randomString } from 'n8n-workflow';
+import request from 'supertest';
 
 import { AuthService } from '@/auth/auth.service';
 import config from '@/config';
-import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+import { AUTH_COOKIE_NAME } from '@/constants';
+import { BadRequestError } from '@n8n/errors';
 import { ExternalHooks } from '@/external-hooks';
 import { MFA_ENFORCE_SETTING } from '@/mfa/constants';
+import { MFA_CACHE_KEY } from '@/mfa/mfa.service';
 import { TOTPService } from '@/mfa/totp.service';
+import { CacheService } from '@n8n/backend-services';
 
+import { REST_PATH_SEGMENT } from '../shared/constants';
 import { createOwner, createUser, createUserWithMfaEnabled } from '../shared/db/users';
 import * as utils from '../shared/utils';
 
-jest.mock('@/telemetry');
+vi.mock('@/telemetry');
 
 let owner: User;
 
@@ -218,6 +224,42 @@ describe('Disable MFA setup', () => {
 
 		await testServer.authAgentFor(user).post('/mfa/disable').send({ anotherParam: '' }).expect(400);
 	});
+
+	test('should keep a session issued before disabling MFA invalid after MFA is enabled again', async () => {
+		const { user, rawSecret } = await createUserWithMfaEnabled();
+		const earlierToken = Container.get(AuthService).issueJWT(user, true, 'test-browser-id');
+		const getCurrentUser = async (token: string) =>
+			await request(testServer.app)
+				.get(`/${REST_PATH_SEGMENT}/login`)
+				.set('Cookie', `${AUTH_COOKIE_NAME}=${token}`);
+
+		expect((await getCurrentUser(earlierToken)).status).toBe(200);
+
+		await testServer
+			.authAgentFor(user)
+			.post('/mfa/disable')
+			.send({ mfaCode: new TOTPService().generateTOTP(rawSecret) })
+			.expect(200);
+
+		expect((await getCurrentUser(earlierToken)).status).toBe(401);
+
+		const userWithoutMfa = await Container.get(UserRepository).findOneOrFail({
+			where: { id: user.id },
+		});
+		const qrResponse = await testServer.authAgentFor(userWithoutMfa).get('/mfa/qr').expect(200);
+		const mfaCode = new TOTPService().generateTOTP(qrResponse.body.data.secret);
+		await testServer.authAgentFor(userWithoutMfa).post('/mfa/verify').send({ mfaCode }).expect(200);
+		await testServer.authAgentFor(userWithoutMfa).post('/mfa/enable').send({ mfaCode }).expect(200);
+
+		// Confirm the final rejection follows a real, different enrollment, not an MFA-less user.
+		const userWithNewMfa = await Container.get(UserRepository).findOneOrFail({
+			where: { id: user.id },
+		});
+		expect(userWithNewMfa.mfaEnabled).toBe(true);
+		expect(userWithNewMfa.mfaSecret).not.toBe(user.mfaSecret);
+
+		expect((await getCurrentUser(earlierToken)).status).toBe(401);
+	});
 });
 
 describe('Change password with MFA enabled', () => {
@@ -413,16 +455,39 @@ describe('Login', () => {
 });
 
 describe('Enforce MFA', () => {
+	test('should return 403 when security policy is managed by env', async () => {
+		const instanceSettingsLoaderConfig = Container.get(InstanceSettingsLoaderConfig);
+		instanceSettingsLoaderConfig.securityPolicyManagedByEnv = true;
+
+		try {
+			owner.mfaEnabled = true;
+			await testServer
+				.authAgentFor(owner)
+				.post('/mfa/enforce-mfa')
+				.send({ enforce: true })
+				.expect(403);
+		} finally {
+			owner.mfaEnabled = false;
+			instanceSettingsLoaderConfig.securityPolicyManagedByEnv = false;
+		}
+	});
+
 	test('Enforce MFA for the instance', async () => {
 		const settingsRepository = Container.get(SettingsRepository);
+		const cacheService = Container.get(CacheService);
 
 		await settingsRepository.delete({
 			key: MFA_ENFORCE_SETTING,
 		});
 
+		await cacheService.delete(MFA_CACHE_KEY);
+
 		let enforced = await settingsRepository.findByKey(MFA_ENFORCE_SETTING);
 
+		let enforcedCache = await cacheService.get(MFA_CACHE_KEY);
+
 		expect(enforced).toBe(null);
+		expect(enforcedCache).toBe(undefined);
 
 		owner.mfaEnabled = true;
 		await testServer
@@ -433,24 +498,34 @@ describe('Enforce MFA', () => {
 		owner.mfaEnabled = false;
 
 		enforced = await settingsRepository.findByKey(MFA_ENFORCE_SETTING);
+		enforcedCache = await cacheService.get(MFA_CACHE_KEY);
 
 		expect(enforced?.value).toBe('true');
+		expect(enforcedCache).toBe('true');
 
 		await settingsRepository.delete({
 			key: MFA_ENFORCE_SETTING,
 		});
+		await cacheService.delete(MFA_CACHE_KEY);
 	});
 
 	test('Disable MFA for the instance', async () => {
 		const settingsRepository = Container.get(SettingsRepository);
+		const cacheService = Container.get(CacheService);
 
-		await settingsRepository.delete({
+		await settingsRepository.save({
 			key: MFA_ENFORCE_SETTING,
+			value: 'true',
+			loadOnStartup: true,
 		});
 
-		let enforced = await settingsRepository.findByKey(MFA_ENFORCE_SETTING);
+		await cacheService.set(MFA_CACHE_KEY, 'true');
 
-		expect(enforced).toBe(null);
+		let enforced = await settingsRepository.findByKey(MFA_ENFORCE_SETTING);
+		let enforcedCache = await cacheService.get(MFA_CACHE_KEY);
+
+		expect(enforced?.value).toBe('true');
+		expect(enforcedCache).toBe('true');
 
 		owner.mfaEnabled = true;
 		await testServer
@@ -461,9 +536,112 @@ describe('Enforce MFA', () => {
 		owner.mfaEnabled = false;
 
 		enforced = await settingsRepository.findByKey(MFA_ENFORCE_SETTING);
+		enforcedCache = await cacheService.get(MFA_CACHE_KEY);
 
 		expect(enforced?.value).toBe('false');
+		expect(enforcedCache).toBe('false');
 
+		await settingsRepository.delete({
+			key: MFA_ENFORCE_SETTING,
+		});
+		await cacheService.delete(MFA_CACHE_KEY);
+	});
+
+	test('User without MFA should be able to access MFA setup endpoints when enforcement is enabled', async () => {
+		const settingsRepository = Container.get(SettingsRepository);
+
+		// Enable MFA enforcement as owner with MFA
+		owner.mfaEnabled = true;
+		await testServer
+			.authAgentFor(owner)
+			.post('/mfa/enforce-mfa')
+			.send({ enforce: true })
+			.expect(200);
+		owner.mfaEnabled = false;
+
+		// Create a regular user without MFA
+		const user = await createUser();
+
+		// User should be able to access /mfa/qr to get QR code and secret
+		const qrResponse = await testServer.authAgentFor(user).get('/mfa/qr').expect(200);
+
+		const { secret } = qrResponse.body.data;
+		expect(secret).toBeDefined();
+
+		// User should be able to verify MFA code
+		const mfaCode = new TOTPService().generateTOTP(secret);
+		await testServer.authAgentFor(user).post('/mfa/verify').send({ mfaCode }).expect(200);
+
+		// User should be able to enable MFA
+		await testServer.authAgentFor(user).post('/mfa/enable').send({ mfaCode }).expect(200);
+
+		// Verify MFA was enabled for the user
+		const updatedUser = await Container.get(UserRepository).findOneOrFail({
+			where: { id: user.id },
+		});
+		expect(updatedUser.mfaEnabled).toBe(true);
+
+		// Clean up
+		await settingsRepository.delete({
+			key: MFA_ENFORCE_SETTING,
+		});
+	});
+
+	test('User without MFA should be blocked from regular endpoints when enforcement is enabled', async () => {
+		const settingsRepository = Container.get(SettingsRepository);
+
+		// Enable MFA enforcement
+		owner.mfaEnabled = true;
+		await testServer
+			.authAgentFor(owner)
+			.post('/mfa/enforce-mfa')
+			.send({ enforce: true })
+			.expect(200);
+		owner.mfaEnabled = false;
+
+		// Create a regular user without MFA
+		const user = await createUser();
+
+		// User should be blocked from accessing change password endpoint
+		const response = await testServer
+			.authAgentFor(user)
+			.patch('/me/password')
+			.send({ currentPassword: 'password', newPassword: 'newPassword123!' })
+			.expect(401);
+
+		expect(response.body.message).toBe('Unauthorized');
+		expect(response.body.mfaRequired).toBe(true);
+
+		// Clean up
+		await settingsRepository.delete({
+			key: MFA_ENFORCE_SETTING,
+		});
+	});
+
+	test('User with MFA enabled but not used should be blocked when enforcement is enabled', async () => {
+		const settingsRepository = Container.get(SettingsRepository);
+
+		// Enable MFA enforcement
+		owner.mfaEnabled = true;
+		await testServer
+			.authAgentFor(owner)
+			.post('/mfa/enforce-mfa')
+			.send({ enforce: true })
+			.expect(200);
+		owner.mfaEnabled = false;
+
+		// Create a user with MFA enabled
+		const { user, rawPassword } = await createUserWithMfaEnabled();
+
+		// Login without MFA code should fail with error code 998
+		const loginResponse = await testServer.authlessAgent
+			.post('/login')
+			.send({ emailOrLdapLoginId: user.email, password: rawPassword })
+			.expect(401);
+
+		expect(loginResponse.body.code).toBe(998);
+
+		// Clean up
 		await settingsRepository.delete({
 			key: MFA_ENFORCE_SETTING,
 		});

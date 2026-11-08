@@ -9,7 +9,7 @@ import {
 	testDb,
 	mockInstance,
 } from '@n8n/backend-test-utils';
-import type { PublicUser, User } from '@n8n/db';
+import type { Project, PublicUser, User } from '@n8n/db';
 import {
 	FolderRepository,
 	GLOBAL_ADMIN_ROLE,
@@ -17,19 +17,16 @@ import {
 	GLOBAL_OWNER_ROLE,
 	ProjectRelationRepository,
 	ProjectRepository,
+	RoleMappingRuleRepository,
+	RoleRepository,
 	SharedCredentialsRepository,
 	SharedWorkflowRepository,
 	UserRepository,
 } from '@n8n/db';
 import { Container } from '@n8n/di';
-import { v4 as uuid } from 'uuid';
-
-import { RESPONSE_ERROR_MESSAGES } from '@/constants';
-import { UsersController } from '@/controllers/users.controller';
-import { ExecutionService } from '@/executions/execution.service';
-import { CacheService } from '@/services/cache/cache.service';
-import { Telemetry } from '@/telemetry';
 import { createFolder } from '@test-integration/db/folders';
+import { createRole } from '@test-integration/db/roles';
+import { v4 as uuid } from 'uuid';
 
 import { SUCCESS_RESPONSE_BODY } from './shared/constants';
 import {
@@ -41,7 +38,14 @@ import { createAdmin, createMember, createOwner, createUser, getUserById } from 
 import type { SuperAgentTest } from './shared/types';
 import * as utils from './shared/utils/';
 import { validateUser } from './shared/utils/users';
-import { createRole } from '@test-integration/db/roles';
+
+import { RESPONSE_ERROR_MESSAGES } from '@/constants';
+import { ExecutionService } from '@/executions/execution.service';
+import { ProvisioningService } from '@/modules/provisioning.ee/provisioning.service.ee';
+import { setSamlLoginEnabled } from '@/modules/sso-saml/saml-helpers';
+import { OwnershipService } from '@/services/ownership.service';
+import { CHANGE_ROLE_ERROR_MESSAGES } from '@/services/user.service';
+import { Telemetry } from '@/telemetry';
 
 mockInstance(Telemetry);
 mockInstance(ExecutionService);
@@ -55,6 +59,8 @@ describe('GET /users', () => {
 	let owner: User;
 	let member1: User;
 	let member2: User;
+	/** Team project where `member1` and `member2` are linked (for project-scoped listing as a member). */
+	let sharedListTeamProject: Project;
 	let ownerAgent: SuperAgentTest;
 	let memberAgent: SuperAgentTest;
 	let userRepository: UserRepository;
@@ -91,7 +97,9 @@ describe('GET /users', () => {
 			mfaEnabled: true,
 		});
 
-		for (let i = 0; i < 10; i++) {
+		sharedListTeamProject = await createTeamProject('shared-list-project', member1);
+		await linkUserToProject(member2, sharedListTeamProject, 'project:viewer');
+		for (let i = 0; i < 9; i++) {
 			await createTeamProject(`project${i}`, member1);
 		}
 
@@ -227,6 +235,16 @@ describe('GET /users', () => {
 				expect(_user.isOwner).toBe(false);
 			});
 
+			test('should filter users by a scope their global role holds', async () => {
+				const response = await ownerAgent
+					.get('/users')
+					.query('filter={ "scope": "nodeTypePolicy:manage" }')
+					.expect(200);
+
+				const emails = response.body.data.items.map((user: PublicUser) => user.email);
+				expect(emails.sort()).toEqual(['admin@n8n.io', 'owner@n8n.io']);
+			});
+
 			test('should filter users by mfaEnabled field', async () => {
 				const response = await ownerAgent
 					.get('/users')
@@ -285,6 +303,62 @@ describe('GET /users', () => {
 					items: expect.arrayContaining([]),
 				});
 				expect(_response.body.data.items).toHaveLength(0);
+			});
+
+			test('should filter users by ids', async () => {
+				const response = await ownerAgent
+					.get('/users')
+					.query(`filter={ "ids": ["${member1.id}", "${member2.id}"] }`)
+					.expect(200);
+
+				expect(response.body.data).toEqual({
+					count: 2,
+					items: expect.arrayContaining([]),
+				});
+				expect(response.body.data.items).toHaveLength(2);
+
+				const returnedIds = response.body.data.items.map((user: PublicUser) => user.id);
+				expect(returnedIds).toContain(member1.id);
+				expect(returnedIds).toContain(member2.id);
+			});
+
+			test('should filter users by isPending', async () => {
+				// Create a pending user (user without password)
+				const pendingUser = await createUser({
+					role: GLOBAL_MEMBER_ROLE,
+					email: 'pending-filter-test@n8n.io',
+					firstName: 'PendingFilter',
+					lastName: 'Test',
+					password: null,
+				});
+
+				try {
+					const response = await ownerAgent
+						.get('/users')
+						.query('filter={ "isPending": true }')
+						.expect(200);
+
+					expect(response.body.data.items.length).toBeGreaterThan(0);
+					const foundPendingUser = response.body.data.items.find(
+						(user: PublicUser) => user.id === pendingUser.id,
+					);
+					expect(foundPendingUser).toBeDefined();
+					expect(foundPendingUser!.email).toBe('pending-filter-test@n8n.io');
+
+					const _response = await ownerAgent
+						.get('/users')
+						.query('filter={ "isPending": false }')
+						.expect(200);
+
+					const nonPendingUserIds = _response.body.data.items.map((user: PublicUser) => user.id);
+					expect(nonPendingUserIds).not.toContain(pendingUser.id);
+					expect(nonPendingUserIds).toContain(member1.id);
+					expect(nonPendingUserIds).toContain(member2.id);
+					expect(nonPendingUserIds).toContain(owner.id);
+				} finally {
+					// Clean up the pending user
+					await userRepository.delete({ id: pendingUser.id });
+				}
 			});
 		});
 
@@ -528,26 +602,20 @@ describe('GET /users', () => {
 					)
 					.expect(200);
 
-				expect(response.body).toEqual({
-					data: {
-						count: 1,
-						items: [
-							{
-								id: expect.any(String),
-								firstName: expect.any(String),
-								projectRelations: [
-									{
-										id: project.id,
-										role: 'project:admin',
-										name: project.name, // Ensure the project name is included
-									},
-								],
-							},
-						],
-					},
-				});
-
-				expect(response.body.data.items[0].projectRelations).toHaveLength(1);
+				expect(response.body.data.count).toBe(1);
+				expect(response.body.data.items).toHaveLength(1);
+				const [userWithProjects] = response.body.data.items;
+				expect(userWithProjects.firstName).toBe(member2.firstName);
+				expect(userWithProjects.projectRelations).toEqual(
+					expect.arrayContaining([
+						{
+							id: project.id,
+							role: 'project:admin',
+							name: project.name,
+							icon: null,
+						},
+					]),
+				);
 			});
 
 			test('should expand on projects and hide personal projects', async () => {
@@ -585,13 +653,14 @@ describe('GET /users', () => {
 					lastName: 'PendingLastName',
 					password: null,
 				});
+				await linkUserToProject(pendingUser, sharedListTeamProject, 'project:viewer');
 			});
 
 			afterAll(async () => {
 				await userRepository.delete({ id: pendingUser.id });
 			});
 
-			test('should include inviteAcceptUrl for pending users', async () => {
+			test('should not include inviteAcceptUrl when listing users', async () => {
 				const response = await ownerAgent.get('/users').expect(200);
 
 				const responseData = response.body.data as {
@@ -602,10 +671,7 @@ describe('GET /users', () => {
 				const pendingUserInResponse = responseData.items.find((user) => user.id === pendingUser.id);
 
 				expect(pendingUserInResponse).toBeDefined();
-				expect(pendingUserInResponse!.inviteAcceptUrl).toBeDefined();
-				expect(pendingUserInResponse!.inviteAcceptUrl).toMatch(
-					new RegExp(`/signup\\?inviterId=${owner.id}&inviteeId=${pendingUser.id}`),
-				);
+				expect(pendingUserInResponse!.inviteAcceptUrl).toBeUndefined();
 
 				const nonPendingUser = responseData.items.find((user) => user.id === member1.id);
 
@@ -615,7 +681,10 @@ describe('GET /users', () => {
 			});
 
 			test('should not include inviteAcceptUrl for pending users, if member requests it', async () => {
-				const response = await memberAgent.get('/users').expect(200);
+				const response = await memberAgent
+					.get('/users')
+					.query(`filter={ "projectId": "${sharedListTeamProject.id}" }`)
+					.expect(200);
 
 				const responseData = response.body.data as {
 					count: number;
@@ -770,15 +839,18 @@ describe('GET /users', () => {
 			});
 		});
 
-		describe('field restrictions based on user:create scope', () => {
-			test('should return limited fields for members without user:create scope', async () => {
-				const response = await memberAgent.get('/users').expect(200);
+		describe('field restrictions based on role', () => {
+			test('should return limited fields for members', async () => {
+				const response = await memberAgent
+					.get('/users')
+					.query(`filter={ "projectId": "${sharedListTeamProject.id}" }`)
+					.expect(200);
 
 				const users = response.body.data.items;
 
 				expect(users).toBeInstanceOf(Array);
 
-				// Fields that should be restricted for members without user:create scope
+				// Fields that should be restricted for members (non-owner, non-admin roles)
 				const restrictionsFields = [
 					'mfaEnabled',
 					'settings',
@@ -812,7 +884,7 @@ describe('GET /users', () => {
 				});
 			});
 
-			test('should return full fields for owners/admins with user:create scope', async () => {
+			test('should return full fields for owners and admins', async () => {
 				const response = await ownerAgent.get('/users').expect(200);
 
 				const users = response.body.data.items;
@@ -824,6 +896,18 @@ describe('GET /users', () => {
 				expect(userWithMfa).toHaveProperty('mfaEnabled', true);
 				expect(userWithMfa).toHaveProperty('isOwner');
 				expect(userWithMfa).toHaveProperty('signInType');
+			});
+
+			test('should return 404 when a member lists users for a project they are not in', async () => {
+				const memberOnlyProject = await createTeamProject('member-inaccessible-project', owner);
+
+				const response = await testServer
+					.authAgentFor(member2)
+					.get('/users')
+					.query(`filter={ "projectId": "${memberOnlyProject.id}" }`);
+
+				expect(response.status).toBe(404);
+				expect(response.body.message).toMatch(/project/i);
 			});
 		});
 	});
@@ -859,6 +943,30 @@ describe('GET /users/:id/password-reset-link', () => {
 		await memberAgent.get(`/users/${owner.id}/password-reset-link`).expect(403);
 		await memberAgent.get(`/users/${admin.id}/password-reset-link`).expect(403);
 		await memberAgent.get(`/users/${member.id}/password-reset-link`).expect(403);
+	});
+});
+
+describe('PATCH /users/:id/settings', () => {
+	let owner: User;
+	let member: User;
+
+	beforeAll(async () => {
+		await testDb.truncate(['User']);
+
+		[owner, member] = await Promise.all([createOwner(), createMember()]);
+	});
+
+	it('should update the settings of another user and return them', async () => {
+		const response = await testServer
+			.authAgentFor(owner)
+			.patch(`/users/${member.id}/settings`)
+			.send({ allowSSOManualLogin: true })
+			.expect(200);
+
+		expect(response.body.data.allowSSOManualLogin).toBe(true);
+
+		const storedMember = await getUserById(member.id);
+		expect(storedMember.settings?.allowSSOManualLogin).toBe(true);
 	});
 });
 
@@ -1055,8 +1163,6 @@ describe('DELETE /users/:id', () => {
 			createFolder(transfereePersonalProject, { name: 'folder1' }),
 		]);
 
-		const deleteSpy = jest.spyOn(Container.get(CacheService), 'deleteMany');
-
 		//
 		// ACT
 		//
@@ -1068,14 +1174,6 @@ describe('DELETE /users/:id', () => {
 		//
 		// ASSERT
 		//
-
-		expect(deleteSpy).toBeCalledWith(
-			expect.arrayContaining([
-				`credential-can-use-secrets:${sharedByTransfereeCredential.id}`,
-				`credential-can-use-secrets:${ownedCredential.id}`,
-			]),
-		);
-		deleteSpy.mockClear();
 
 		const userRepository = Container.get(UserRepository);
 		const projectRepository = Container.get(ProjectRepository);
@@ -1102,7 +1200,7 @@ describe('DELETE /users/:id', () => {
 					projectId: transfereePersonalProject.id,
 					role: 'workflow:owner',
 				}),
-			).resolves.not.toBeNull,
+			).resolves.not.toBeNull(),
 			expect(
 				sharedCredentialsRepository.findOneBy({
 					credentialsId: ownedCredential.id,
@@ -1125,7 +1223,7 @@ describe('DELETE /users/:id', () => {
 					projectId: transfereePersonalProject.id,
 					role: 'credential:user',
 				}),
-			),
+			).resolves.not.toBeNull(),
 
 			// the transferee is still owner of the workflow and credential they shared with the user to delete
 			expect(
@@ -1214,8 +1312,6 @@ describe('DELETE /users/:id', () => {
 			createFolder(teamProject, { name: 'folder1' }),
 		]);
 
-		const deleteSpy = jest.spyOn(Container.get(CacheService), 'deleteMany');
-
 		//
 		// ACT
 		//
@@ -1227,8 +1323,6 @@ describe('DELETE /users/:id', () => {
 		//
 		// ASSERT
 		//
-
-		deleteSpy.mockClear();
 
 		const sharedWorkflowRepository = Container.get(SharedWorkflowRepository);
 		const sharedCredentialRepository = Container.get(SharedCredentialsRepository);
@@ -1266,6 +1360,23 @@ describe('DELETE /users/:id', () => {
 		);
 
 		expect(deletedUserFolders).toHaveLength(0);
+	});
+
+	test('should transfer the work to a team project without members', async () => {
+		const memberToDelete = await createMember();
+		const emptyTeamProject = await createTeamProject('empty project');
+		const workflow = await createWorkflow({ name: 'workflow1' }, memberToDelete);
+
+		await ownerAgent
+			.delete(`/users/${memberToDelete.id}`)
+			.query({ transferId: emptyTeamProject.id })
+			.expect(200);
+
+		const owningProject = await Container.get(SharedWorkflowRepository).getWorkflowOwningProject(
+			workflow.id,
+		);
+		expect(owningProject?.id).toBe(emptyTeamProject.id);
+		expect(await Container.get(UserRepository).findOneBy({ id: memberToDelete.id })).toBeNull();
 	});
 
 	test('should fail to delete self', async () => {
@@ -1326,19 +1437,18 @@ describe('PATCH /users/:id/role', () => {
 	let memberAgent: SuperAgentTest;
 	let authlessAgent: SuperAgentTest;
 
-	const { NO_ADMIN_ON_OWNER, NO_USER, NO_OWNER_ON_OWNER } =
-		UsersController.ERROR_MESSAGES.CHANGE_ROLE;
+	const { NO_ADMIN_ON_OWNER, NO_USER, CANNOT_CHANGE_OWN_ROLE } = CHANGE_ROLE_ERROR_MESSAGES;
 
 	beforeAll(async () => {
 		await testDb.truncate(['User']);
 
-		[owner, admin, otherAdmin, member, otherMember] = await Promise.all([
+		[owner, admin, otherAdmin, member, otherMember] = [
 			await createOwner(),
 			await createAdmin(),
 			await createAdmin(),
 			await createMember(),
 			await createMember(),
-		]);
+		];
 
 		ownerAgent = testServer.authAgentFor(owner);
 		adminAgent = testServer.authAgentFor(admin);
@@ -1535,7 +1645,7 @@ describe('PATCH /users/:id/role', () => {
 			});
 
 			expect(response.statusCode).toBe(403);
-			expect(response.body.message).toBe(NO_OWNER_ON_OWNER);
+			expect(response.body.message).toBe(CANNOT_CHANGE_OWN_ROLE);
 		});
 
 		test('should fail to demote self to member', async () => {
@@ -1544,7 +1654,7 @@ describe('PATCH /users/:id/role', () => {
 			});
 
 			expect(response.statusCode).toBe(403);
-			expect(response.body.message).toBe(NO_OWNER_ON_OWNER);
+			expect(response.body.message).toBe(CANNOT_CHANGE_OWN_ROLE);
 		});
 
 		test('should fail to promote member to admin if not licensed', async () => {
@@ -1619,16 +1729,33 @@ describe('PATCH /users/:id/role', () => {
 			linkUserToProject(user, project2, 'project:editor'),
 		]);
 
-		const deleteSpy = jest.spyOn(Container.get(CacheService), 'deleteMany');
 		const response = await ownerAgent.patch(`/users/${user.id}/role`).send({
 			newRoleName: 'global:member',
 		});
 
-		expect(deleteSpy).toBeCalledTimes(2);
-		deleteSpy.mockClear();
-
 		expect(response.statusCode).toBe(200);
 		expect(response.body.data).toStrictEqual({ success: true });
+	});
+
+	test('should invalidate project-owner cache when changing user role', async () => {
+		const user = await createMember();
+		const personalProject = await getPersonalProject(user);
+		const ownershipService = Container.get(OwnershipService);
+
+		// Prime the cache
+		const cachedBefore = await ownershipService.getPersonalProjectOwnerCached(personalProject.id);
+		expect(cachedBefore?.role.slug).toBe(GLOBAL_MEMBER_ROLE.slug);
+
+		// Change role from member to admin
+		const response = await ownerAgent.patch(`/users/${user.id}/role`).send({
+			newRoleName: 'global:admin',
+		});
+
+		expect(response.statusCode).toBe(200);
+
+		// Cache should have been invalidated, so the next call fetches fresh data
+		const cachedAfter = await ownershipService.getPersonalProjectOwnerCached(personalProject.id);
+		expect(cachedAfter?.role.slug).toBe(GLOBAL_ADMIN_ROLE.slug);
 	});
 
 	test('should fail to change to non-existing role', async () => {
@@ -1643,6 +1770,7 @@ describe('PATCH /users/:id/role', () => {
 	});
 
 	test('should change to existing custom role', async () => {
+		testServer.license.enable('feat:customRoles');
 		const customRole = 'custom:role';
 		await createRole({ slug: customRole, displayName: 'Custom Role 1', roleType: 'global' });
 		const response = await ownerAgent.patch(`/users/${member.id}/role`).send({
@@ -1655,5 +1783,169 @@ describe('PATCH /users/:id/role', () => {
 		const user = await getUserById(member.id);
 
 		expect(user.role.slug).toBe(customRole);
+	});
+
+	describe('when instance roles are managed by provisioning', () => {
+		let provisioningService: ProvisioningService;
+		let savedConfig: Record<string, unknown>;
+
+		beforeEach(async () => {
+			provisioningService = Container.get(ProvisioningService);
+			await provisioningService.getConfig();
+			// @ts-expect-error - provisioningConfig is private
+			savedConfig = { ...provisioningService.provisioningConfig };
+			// The lock applies only while SAML or OIDC sign-in is on.
+			testServer.license.enable('feat:saml');
+			await setSamlLoginEnabled(true);
+		});
+
+		afterEach(async () => {
+			// @ts-expect-error - provisioningConfig is private
+			provisioningService.provisioningConfig = { ...savedConfig };
+			await Container.get(RoleMappingRuleRepository).delete({});
+			await setSamlLoginEnabled(false);
+		});
+
+		test('should return 403 when SSO provider controls instance roles', async () => {
+			// @ts-expect-error - provisioningConfig is private
+			provisioningService.provisioningConfig.scopesProvisionInstanceRole = true;
+
+			await ownerAgent
+				.patch(`/users/${member.id}/role`)
+				.send({ newRoleName: 'global:admin' })
+				.expect(403);
+		});
+
+		test('should return 403 when expression-based role mapping is active', async () => {
+			// @ts-expect-error - provisioningConfig is private
+			provisioningService.provisioningConfig.scopesUseExpressionMapping = true;
+
+			// Expression mapping only manages instance roles when instance-type rules exist.
+			const adminRole = await Container.get(RoleRepository).findOneOrFail({
+				where: { slug: 'global:admin' },
+			});
+			const ruleRepository = Container.get(RoleMappingRuleRepository);
+			await ruleRepository.save(
+				ruleRepository.create({
+					expression: '{{ true }}',
+					role: adminRole,
+					type: 'instance',
+					order: 0,
+				}),
+			);
+
+			await ownerAgent
+				.patch(`/users/${member.id}/role`)
+				.send({ newRoleName: 'global:admin' })
+				.expect(403);
+		});
+	});
+});
+
+describe('GET /users account status', () => {
+	let owner: User;
+	let member: User;
+	let disabledIds: string[];
+
+	beforeAll(async () => {
+		// Earlier tests leave workflows, credentials and folders in projects.
+		// Delete them before the projects, so that the setup does not depend on
+		// cascading deletes.
+		await testDb.truncate([
+			'SharedWorkflow',
+			'SharedCredentials',
+			'WorkflowEntity',
+			'CredentialsEntity',
+			'Folder',
+			'ProjectRelation',
+			'Project',
+			'User',
+		]);
+
+		owner = await createOwner();
+		member = await createMember();
+		const others = await Promise.all(Array.from({ length: 8 }, async () => await createMember()));
+		disabledIds = others.slice(0, 2).map(({ id }) => id);
+		await Container.get(UserRepository).update(disabledIds, { disabled: true });
+	});
+
+	test('should return the deactivated users and the counts of every status', async () => {
+		const response = await testServer
+			.authAgentFor(owner)
+			.get('/users')
+			.query({ filter: JSON.stringify({ status: 'deactivated' }), includeStatusCounts: true })
+			.expect(200);
+
+		const { count, items, statusCounts } = response.body.data;
+		expect(count).toBe(2);
+		expect(items.map(({ id }: { id: string }) => id).sort()).toEqual([...disabledIds].sort());
+		expect(items.every(({ disabled }: { disabled: boolean }) => disabled)).toBe(true);
+		expect(statusCounts).toEqual({ all: 10, active: 8, deactivated: 2 });
+	});
+
+	// The tab counts follow every list filter except status, the role filter too.
+	test('should apply the role filter to the status counts', async () => {
+		const response = await testServer
+			.authAgentFor(owner)
+			.get('/users')
+			.query({
+				filter: JSON.stringify({ scope: 'nodeTypePolicy:manage' }),
+				includeStatusCounts: true,
+			})
+			.expect(200);
+
+		const { count, items, statusCounts } = response.body.data;
+		expect(count).toBe(1);
+		expect(items.map(({ id }: { id: string }) => id)).toEqual([owner.id]);
+		expect(statusCounts).toEqual({ all: 1, active: 1, deactivated: 0 });
+	});
+
+	test('should return the active users with the active status filter', async () => {
+		const response = await testServer
+			.authAgentFor(owner)
+			.get('/users')
+			.query({ filter: JSON.stringify({ status: 'active' }) })
+			.expect(200);
+
+		const { count, items, statusCounts } = response.body.data;
+		expect(count).toBe(8);
+		expect(items.some(({ disabled }: { disabled: boolean }) => disabled)).toBe(false);
+		// Counts only on request, so the list response of other callers does not change.
+		expect(statusCounts).toBeUndefined();
+	});
+
+	test('should return the account status to owners and admins', async () => {
+		const response = await testServer.authAgentFor(owner).get('/users').expect(200);
+
+		const { items } = response.body.data;
+		for (const user of items) {
+			expect(typeof user.disabled).toBe('boolean');
+		}
+	});
+
+	test('should hide the account status from members, their own user included', async () => {
+		const response = await testServer.authAgentFor(member).get('/users').expect(200);
+
+		const { items, statusCounts } = response.body.data;
+		expect(statusCounts).toBeUndefined();
+		expect(items.some(({ id }: { id: string }) => id === member.id)).toBe(true);
+		for (const user of items) {
+			expect(user).not.toHaveProperty('disabled');
+		}
+	});
+
+	test.each([
+		['filters by status', { filter: JSON.stringify({ status: 'deactivated' }) }],
+		['asks for the status counts', { includeStatusCounts: true }],
+	])('should return 403 when a member %s', async (_, query) => {
+		await testServer.authAgentFor(member).get('/users').query(query).expect(403);
+	});
+
+	test('should return 400 for an unknown status', async () => {
+		await testServer
+			.authAgentFor(owner)
+			.get('/users')
+			.query({ filter: JSON.stringify({ status: 'pending' }) })
+			.expect(400);
 	});
 });

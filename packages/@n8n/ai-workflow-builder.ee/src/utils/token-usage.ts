@@ -28,7 +28,8 @@ export function extractLastTokenUsage(messages: unknown[]): TokenUsage | undefin
 	const lastAiAssistantMessage = messages.findLast(
 		(m): m is AIMessageWithUsageMetadata =>
 			m instanceof AIMessage &&
-			m.response_metadata?.usage !== undefined &&
+			typeof m.response_metadata?.usage === 'object' &&
+			m.response_metadata.usage !== null &&
 			'input_tokens' in m.response_metadata.usage &&
 			'output_tokens' in m.response_metadata.usage,
 	);
@@ -48,7 +49,12 @@ function concatenateMessageContent(messages: BaseMessage[]): string {
 			return (
 				acc +
 				message.content.reduce((innerAcc: string, item) => {
-					if (typeof item === 'object' && item !== null && 'text' in item) {
+					if (
+						typeof item === 'object' &&
+						item !== null &&
+						'text' in item &&
+						typeof item.text === 'string'
+					) {
 						return innerAcc + item.text;
 					}
 					return innerAcc;

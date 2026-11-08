@@ -6,26 +6,38 @@ import { getResourcePermissions } from '../get-resource-permissions.ee';
 describe('permissions', () => {
 	it('getResourcePermissions for empty scopes', () => {
 		expect(getResourcePermissions()).toEqual({
+			app: {},
+			agent: {},
+			aiAssistant: {},
+			aiPreference: {},
+			projectAiPreference: {},
+			skill: {},
+			projectSkill: {},
 			annotationTag: {},
 			auditLogs: {},
 			banner: {},
 			community: {},
 			communityPackage: {},
 			credential: {},
+			credentialTypePolicy: {},
 			externalSecretsProvider: {},
 			externalSecret: {},
 			eventBusDestination: {},
 			execution: {},
+			testRun: {},
 			ldap: {},
 			license: {},
 			logStreaming: {},
+			nodeTypePolicy: {},
 			oidc: {},
 			orchestration: {},
 			project: {},
 			saml: {},
 			provisioning: {},
 			securityAudit: {},
+			securitySettings: {},
 			sourceControl: {},
+			promotions: {},
 			tag: {},
 			user: {},
 			variable: {},
@@ -42,10 +54,20 @@ describe('permissions', () => {
 			chatHub: {},
 			chatHubAgent: {},
 			breakingChanges: {},
+			apiKey: {},
+			encryptionKey: {},
+			credentialResolver: {},
+			instanceAi: {},
+			roleMappingRule: {},
+			otel: {},
+			scim: {},
+			trustedSource: {},
 		});
 	});
 	it('getResourcePermissions', () => {
 		const scopes: Scope[] = [
+			'app:read',
+			'app:list',
 			'credential:create',
 			'credential:delete',
 			'credential:list',
@@ -77,9 +99,17 @@ describe('permissions', () => {
 			'folder:create',
 			'insights:list',
 			'breakingChanges:list',
+			'apiKey:manage',
 		];
 
 		const permissionRecord: PermissionsRecord = {
+			app: { read: true, list: true },
+			agent: {},
+			aiAssistant: {},
+			aiPreference: {},
+			projectAiPreference: {},
+			skill: {},
+			projectSkill: {},
 			annotationTag: {},
 			auditLogs: {},
 			banner: {},
@@ -94,6 +124,7 @@ describe('permissions', () => {
 				share: true,
 				update: true,
 			},
+			credentialTypePolicy: {},
 			eventBusDestination: {
 				list: true,
 				test: true,
@@ -103,6 +134,7 @@ describe('permissions', () => {
 			ldap: {},
 			license: {},
 			logStreaming: {},
+			nodeTypePolicy: {},
 			orchestration: {},
 			project: {
 				list: true,
@@ -114,7 +146,9 @@ describe('permissions', () => {
 			mcp: {},
 			mcpApiKey: {},
 			securityAudit: {},
+			securitySettings: {},
 			sourceControl: {},
+			promotions: {},
 			tag: {
 				create: true,
 				list: true,
@@ -151,6 +185,7 @@ describe('permissions', () => {
 			},
 			dataTable: {},
 			execution: {},
+			testRun: {},
 			workflowTags: {},
 			role: {},
 			chatHub: {},
@@ -158,6 +193,16 @@ describe('permissions', () => {
 			breakingChanges: {
 				list: true,
 			},
+			apiKey: {
+				manage: true,
+			},
+			encryptionKey: {},
+			credentialResolver: {},
+			instanceAi: {},
+			roleMappingRule: {},
+			otel: {},
+			scim: {},
+			trustedSource: {},
 		};
 
 		expect(getResourcePermissions(scopes)).toEqual(permissionRecord);

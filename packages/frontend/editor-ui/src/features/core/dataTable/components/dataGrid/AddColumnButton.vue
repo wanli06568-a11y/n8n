@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, ref, toValue, watch } from 'vue';
 import type {
 	AddColumnResponse,
 	DataTableColumnCreatePayload,
@@ -9,7 +9,7 @@ import { DATA_TABLE_COLUMN_TYPES } from '@/features/core/dataTable/dataTable.typ
 import { useI18n } from '@n8n/i18n';
 import { useDataTableTypes } from '@/features/core/dataTable/composables/useDataTableTypes';
 import { COLUMN_NAME_REGEX, MAX_COLUMN_NAME_LENGTH } from '@/features/core/dataTable/constants';
-import { useDebounce } from '@/app/composables/useDebounce';
+import { useDebounce } from '@n8n/composables/useDebounce';
 
 import {
 	N8nButton,
@@ -18,7 +18,7 @@ import {
 	N8nInput,
 	N8nInputLabel,
 	N8nOption,
-	N8nPopoverReka,
+	N8nPopover,
 	N8nSelect,
 	N8nText,
 	N8nTooltip,
@@ -28,16 +28,39 @@ type FormError = {
 	description?: string;
 };
 
-const props = defineProps<{
-	// the params key is needed so that we can pass this directly to ag-grid as column
-	params: {
-		onAddColumn: (column: DataTableColumnCreatePayload) => Promise<AddColumnResponse>;
-	};
-	popoverId?: string;
-	useTextTrigger?: boolean;
-}>();
+const props = withDefaults(
+	defineProps<{
+		// the params key is needed so that we can pass this directly to ag-grid as column
+		params: {
+			onAddColumn: (column: DataTableColumnCreatePayload) => Promise<AddColumnResponse>;
+			disabled?: boolean | (() => boolean);
+			disabledTooltip?: string | (() => string | undefined);
+		};
+		popoverId?: string;
+		useTextTrigger?: boolean;
+		disabled?: boolean;
+		/** Shown instead of the default label while the button is disabled. */
+		disabledTooltip?: string;
+	}>(),
+	{
+		disabled: false,
+	},
+);
+
+// Use disabled from params if available (when used as AG Grid header), otherwise use prop
+const isDisabled = computed(() => toValue(props.params?.disabled ?? props.disabled));
+
+const disabledTooltip = computed(() =>
+	toValue(props.params?.disabledTooltip ?? props.disabledTooltip),
+);
 
 const i18n = useI18n();
+
+const tooltipContent = computed(() =>
+	isDisabled.value && disabledTooltip.value
+		? disabledTooltip.value
+		: i18n.baseText('dataTable.addColumn.label'),
+);
 const { getIconForType } = useDataTableTypes();
 const { debounce } = useDebounce();
 
@@ -54,6 +77,13 @@ const error = ref<FormError | null>(null);
 const popoverOpen = ref(false);
 const isSelectOpen = ref(false);
 
+watch(isDisabled, (disabled) => {
+	if (disabled) {
+		isSelectOpen.value = false;
+		popoverOpen.value = false;
+	}
+});
+
 const popoverId = computed(() => props.popoverId ?? 'add-column-popover');
 
 const columnTypeOptions = computed(() => {
@@ -66,6 +96,7 @@ const columnTypeOptions = computed(() => {
 });
 
 const onAddButtonClicked = async () => {
+	if (isDisabled.value) return;
 	validateName();
 	if (!columnName.value || !columnType.value || error.value) {
 		return;
@@ -80,7 +111,7 @@ const onAddButtonClicked = async () => {
 		let errorDescription = response.errorMessage;
 		// Provide custom error message for conflict (column already exists)
 		if (response.httpStatus === 409) {
-			errorMessage = i18n.baseText('dataTable.addColumn.alreadyExistsError', {
+			errorMessage = i18n.baseText('dataTable.column.alreadyExistsError', {
 				interpolate: { name: columnName.value },
 			});
 			errorDescription = response.errorMessage?.includes('system')
@@ -107,8 +138,9 @@ const handlePopoverOpenChange = async (open: boolean) => {
 		return;
 	}
 	popoverOpen.value = open;
-	// Focus name input when opening popover
+	// Reset error state and focus name input when opening popover
 	if (open) {
+		error.value = null;
 		await nextTick(() => {
 			nameInputRef.value?.focus();
 		});
@@ -131,9 +163,9 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 </script>
 
 <template>
-	<N8nTooltip :disabled="popoverOpen" :content="i18n.baseText('dataTable.addColumn.label')">
+	<N8nTooltip :disabled="popoverOpen" :content="tooltipContent">
 		<div class="add-column-header-component-wrapper">
-			<N8nPopoverReka
+			<N8nPopover
 				:id="popoverId"
 				:open="popoverOpen"
 				:popper-options="{ strategy: 'fixed' }"
@@ -142,16 +174,21 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 			>
 				<template #trigger>
 					<template v-if="props.useTextTrigger">
-						<N8nButton data-test-id="data-table-add-column-trigger-button" type="tertiary">
+						<N8nButton
+							variant="outline"
+							data-test-id="data-table-add-column-trigger-button"
+							:disabled="isDisabled"
+						>
 							{{ i18n.baseText('dataTable.addColumn.label') }}
 						</N8nButton>
 					</template>
 					<template v-else>
 						<N8nIconButton
+							variant="ghost"
 							data-test-id="data-table-add-column-trigger-button"
-							text
 							icon="plus"
-							type="tertiary"
+							:aria-label="i18n.baseText('dataTable.addColumn.label')"
+							:disabled="isDisabled"
 						/>
 					</template>
 				</template>
@@ -218,8 +255,8 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 								</N8nSelect>
 							</N8nInputLabel>
 							<N8nButton
+								variant="solid"
 								data-test-id="data-table-add-column-submit-button"
-								type="primary"
 								class="mt-m"
 								size="large"
 								:disabled="!columnName || !columnType || !!error"
@@ -230,7 +267,7 @@ const onInput = debounce(validateName, { debounceTime: 100 });
 						</div>
 					</div>
 				</template>
-			</N8nPopoverReka>
+			</N8nPopover>
 		</div>
 	</N8nTooltip>
 </template>

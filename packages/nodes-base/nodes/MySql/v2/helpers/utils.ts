@@ -6,19 +6,32 @@ import type {
 	IPairedItemData,
 	NodeExecutionWithMetadata,
 } from 'n8n-workflow';
-import { NodeOperationError } from 'n8n-workflow';
+import { NodeOperationError, UserError } from 'n8n-workflow';
+
+import { isInsideQuotes } from '@utils/sql-query-parameters';
 
 import type {
 	Mysql2Pool,
+	Mysql2PoolConnection,
 	ParameterMatch,
 	QueryMode,
+	QueryRunner,
 	QueryValues,
 	QueryWithValues,
 	SortRule,
 	WhereClause,
 } from './interfaces';
 import { BATCH_MODE } from './interfaces';
-import { generatePairedItemData } from '../../../../utils/utilities';
+import { operatorOptions } from '../actions/common.descriptions';
+
+// A $N:name placeholder needs text for the identifier; a value resolved from
+// a single expression can be null or undefined, which has no identifier form.
+function toIdentifierText(value: unknown, paramNumber: string): string {
+	if (value === null || value === undefined) {
+		throw new UserError(`Parameter $${paramNumber} has no value to use as an identifier`);
+	}
+	return String(value);
+}
 
 export function escapeSqlIdentifier(identifier: string): string {
 	const parts = identifier.match(/(`[^`]*`|[^.`]+)/g) ?? [];
@@ -52,13 +65,6 @@ function findParameterMatches(rawQuery: string, regex: RegExp): ParameterMatch[]
 	return matches;
 }
 
-function isInsideQuotes(rawQuery: string, index: number): boolean {
-	const beforeMatch = rawQuery.substring(0, index);
-	const singleQuoteCount = (beforeMatch.match(/'/g) || []).length;
-	const doubleQuoteCount = (beforeMatch.match(/"/g) || []).length;
-	return singleQuoteCount % 2 !== 0 || doubleQuoteCount % 2 !== 0;
-}
-
 function filterValidMatches(matches: ParameterMatch[], rawQuery: string): ParameterMatch[] {
 	return matches.filter(({ index }) => !isInsideQuotes(rawQuery, index));
 }
@@ -77,7 +83,7 @@ function processParameterReplacements(
 			if (isName) {
 				processedQuery = processedQuery.replace(
 					matchStr,
-					escapeSqlIdentifier(replacements[matchIndex].toString()),
+					escapeSqlIdentifier(toIdentifierText(replacements[matchIndex], paramNumber)),
 				);
 			} else {
 				processedQuery = processedQuery.replace(matchStr, '?');
@@ -120,6 +126,25 @@ function validateReferencedParameters(
 	}
 }
 
+// Quote-aware parser: only rewrites `$<digit>` placeholders found outside string
+// literals, so values inside quotes (e.g. `'$5'`) are left untouched.
+export const prepareSafeQuery = (rawQuery: string, replacements?: QueryValues): QueryWithValues => {
+	if (replacements === undefined) {
+		return { query: rawQuery, values: [] };
+	}
+
+	const regex = /\$(\d+)(?::name)?/g;
+	const matches = findParameterMatches(rawQuery, regex);
+	const validMatches = filterValidMatches(matches, rawQuery);
+
+	validateReferencedParameters(validMatches, replacements);
+
+	const query = processParameterReplacements(rawQuery, validMatches, replacements);
+	const values = extractValuesFromMatches(validMatches, replacements);
+
+	return { query, values };
+};
+
 export const prepareQueryAndReplacements = (
 	rawQuery: string,
 	nodeVersion: number,
@@ -130,16 +155,7 @@ export const prepareQueryAndReplacements = (
 	}
 
 	if (nodeVersion >= 2.5) {
-		const regex = /\$(\d+)(?::name)?/g;
-		const matches = findParameterMatches(rawQuery, regex);
-		const validMatches = filterValidMatches(matches, rawQuery);
-
-		validateReferencedParameters(validMatches, replacements);
-
-		const query = processParameterReplacements(rawQuery, validMatches, replacements);
-		const values = extractValuesFromMatches(validMatches, replacements);
-
-		return { query, values };
+		return prepareSafeQuery(rawQuery, replacements);
 	}
 
 	return prepareQueryLegacy(rawQuery, replacements);
@@ -157,8 +173,12 @@ export const prepareQueryLegacy = (
 
 	for (const match of matches) {
 		if (match.includes(':name')) {
-			const matchIndex = Number(match.replace('$', '').replace(':name', '')) - 1;
-			query = query.replace(match, escapeSqlIdentifier(replacements[matchIndex].toString()));
+			const paramNumber = match.replace('$', '').replace(':name', '');
+			const matchIndex = Number(paramNumber) - 1;
+			query = query.replace(
+				match,
+				escapeSqlIdentifier(toIdentifierText(replacements[matchIndex], paramNumber)),
+			);
 		} else {
 			const matchIndex = Number(match.replace('$', '')) - 1;
 			query = query.replace(match, '?');
@@ -171,13 +191,14 @@ export const prepareQueryLegacy = (
 
 export function prepareErrorItem(
 	item: IDataObject,
-	error: IDataObject | NodeOperationError | Error,
+	error: NodeOperationError,
 	index: number,
-) {
+): INodeExecutionData {
 	return {
-		json: { message: error.message, item: { ...item }, itemIndex: index, error: { ...error } },
+		json: { message: error.message, item: { ...item }, itemIndex: index },
+		error,
 		pairedItem: { item: index },
-	} as INodeExecutionData;
+	};
 }
 
 export function parseMySqlError(
@@ -310,7 +331,7 @@ export function configureQueryRunner(
 	this: IExecuteFunctions,
 	options: IDataObject,
 	pool: Mysql2Pool,
-) {
+): QueryRunner {
 	return async (queries: QueryWithValues[]) => {
 		if (queries.length === 0) {
 			return [];
@@ -319,7 +340,17 @@ export function configureQueryRunner(
 		let returnData: INodeExecutionData[] = [];
 		const mode = (options.queryBatching as QueryMode) || BATCH_MODE.SINGLE;
 
-		const connection = await pool.getConnection();
+		let connection: Mysql2PoolConnection;
+		try {
+			connection = await pool.getConnection();
+		} catch (e) {
+			const error = parseMySqlError.call(this, e);
+			if (!this.continueOnFail()) {
+				throw error;
+			}
+
+			return [{ json: { message: error.message, error: { ...error } } }];
+		}
 
 		if (mode === BATCH_MODE.SINGLE) {
 			const formattedQueries = queries.map(({ query, values }) => connection.format(query, values));
@@ -357,7 +388,7 @@ export function configureQueryRunner(
 				}
 
 				//because single query is used in this mode mapping itemIndex not possible, setting all items as paired
-				const pairedItem = generatePairedItemData(queries.length);
+				const pairedItem = queries.map((q, index) => ({ item: q.itemIndex ?? index }));
 
 				returnData = returnData.concat(
 					prepareOutput(
@@ -378,6 +409,7 @@ export function configureQueryRunner(
 			if (mode === BATCH_MODE.INDEPENDENTLY) {
 				let formattedQuery = '';
 				for (const [index, queryWithValues] of queries.entries()) {
+					const itemIndex = queryWithValues.itemIndex ?? index;
 					try {
 						const { query, values } = queryWithValues;
 						formattedQuery = connection.format(query, values);
@@ -403,17 +435,17 @@ export function configureQueryRunner(
 								options,
 								statements,
 								this.helpers.constructExecutionMetaData,
-								{ item: index },
+								{ item: itemIndex },
 							),
 						);
 					} catch (err) {
-						const error = parseMySqlError.call(this, err, index, [formattedQuery]);
+						const error = parseMySqlError.call(this, err, itemIndex, [formattedQuery]);
 
 						if (!this.continueOnFail()) {
 							connection.release();
 							throw error;
 						}
-						returnData.push(prepareErrorItem(queries[index], error as Error, index));
+						returnData.push(prepareErrorItem(queries[index], error, itemIndex));
 					}
 				}
 			}
@@ -423,6 +455,7 @@ export function configureQueryRunner(
 
 				let formattedQuery = '';
 				for (const [index, queryWithValues] of queries.entries()) {
+					const itemIndex = queryWithValues.itemIndex ?? index;
 					try {
 						const { query, values } = queryWithValues;
 						formattedQuery = connection.format(query, values);
@@ -448,11 +481,11 @@ export function configureQueryRunner(
 								options,
 								statements,
 								this.helpers.constructExecutionMetaData,
-								{ item: index },
+								{ item: itemIndex },
 							),
 						);
 					} catch (err) {
-						const error = parseMySqlError.call(this, err, index, [formattedQuery]);
+						const error = parseMySqlError.call(this, err, itemIndex, [formattedQuery]);
 
 						if (connection) {
 							await connection.rollback();
@@ -460,7 +493,7 @@ export function configureQueryRunner(
 						}
 
 						if (!this.continueOnFail()) throw error;
-						returnData.push(prepareErrorItem(queries[index], error as Error, index));
+						returnData.push(prepareErrorItem(queries[index], error, itemIndex));
 
 						// Return here because we already rolled back the transaction
 						return returnData;
@@ -532,7 +565,7 @@ export function addWhereClauses(
 		}${valueReplacement}${operator}`;
 	});
 
-	return [`${query}${whereQuery}`, replacements.concat(...values)];
+	return [`${query}${whereQuery}`, replacements.concat.apply(replacements, values)];
 }
 
 export function addSortRules(
@@ -547,11 +580,11 @@ export function addSortRules(
 
 	rules.forEach((rule, index) => {
 		const endWith = index === rules.length - 1 ? '' : ',';
-
-		orderByQuery += ` ${escapeSqlIdentifier(rule.column)} ${rule.direction}${endWith}`;
+		const direction = rule.direction === 'ASC' ? 'ASC' : 'DESC';
+		orderByQuery += ` ${escapeSqlIdentifier(rule.column)} ${direction}${endWith}`;
 	});
 
-	return [`${query}${orderByQuery}`, replacements.concat(...values)];
+	return [`${query}${orderByQuery}`, replacements.concat.apply(replacements, values)];
 }
 
 export function replaceEmptyStringsByNulls(
@@ -575,3 +608,34 @@ export function replaceEmptyStringsByNulls(
 
 	return returnData;
 }
+
+// operations use 'equal' instead of '=' because of the way expressions are handled
+// manually add '=' to allow entering it instead of 'equal'
+const conditionSet = new Set(operatorOptions.map((option) => option.value)).add('=');
+
+export const isWhereClause = (clause: unknown): clause is WhereClause => {
+	if (typeof clause !== 'object' || clause === null) return false;
+	if (!('column' in clause)) return false;
+	if (
+		!('condition' in clause) ||
+		typeof clause.condition !== 'string' ||
+		!conditionSet.has(clause.condition)
+	)
+		return false;
+	return true;
+};
+
+export const getWhereClauses = (ctx: IExecuteFunctions, itemIndex: number): WhereClause[] => {
+	const whereClauses = ctx.getNodeParameter('where', itemIndex, []) as IDataObject;
+	const whereClausesValues = whereClauses.values as unknown[];
+	if (!Array.isArray(whereClausesValues)) {
+		return [];
+	}
+	const someInvalid = whereClausesValues.some((clause) => !isWhereClause(clause));
+	if (someInvalid) {
+		throw new NodeOperationError(ctx.getNode(), 'Invalid where clause', {
+			itemIndex,
+		});
+	}
+	return whereClausesValues as WhereClause[];
+};

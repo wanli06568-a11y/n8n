@@ -208,19 +208,36 @@ export class EvaluationTrigger implements INodeType {
 			const dataTableProxy = await this.helpers.getDataTableProxy(dataTableId);
 
 			const filter = await getDataTableFilter(this, 0);
+			const previousRunRowId = inputData?.[0]?.json?.row_id;
+
+			let effectiveFilter = filter;
+			if (typeof previousRunRowId === 'number' && previousRunRowsLeft !== 0) {
+				effectiveFilter = {
+					type: 'and',
+					filters: [
+						...filter.filters,
+						{
+							columnName: 'id',
+							condition: 'gt',
+							value: previousRunRowId,
+						},
+					],
+				};
+			}
 
 			const { data, count } = await dataTableProxy.getManyRowsAndCount({
-				skip: currentIndex,
+				skip: 0,
 				take: 1,
-				filter,
+				filter: effectiveFilter,
 			});
 
 			if (data.length === 0) {
 				throw new NodeOperationError(this.getNode(), 'No row found');
 			}
 
-			const effectiveTotal = Math.min(count, maxRows);
-			const rowsLeft = Math.max(0, effectiveTotal - (currentIndex + 1));
+			// `count` is the number of rows still matching (current row included), so the
+			// row limit has to be measured against the rows already consumed.
+			const rowsLeft = Math.max(0, Math.min(count - 1, maxRows - currentIndex - 1));
 
 			const currentRow = {
 				json: {

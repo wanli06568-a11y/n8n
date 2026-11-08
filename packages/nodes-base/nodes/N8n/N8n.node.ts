@@ -3,6 +3,8 @@ import { NodeConnectionTypes, type INodeType, type INodeTypeDescription } from '
 import { auditFields, auditOperations } from './AuditDescription';
 import { credentialFields, credentialOperations } from './CredentialDescription';
 import { executionFields, executionOperations } from './ExecutionDescription';
+import { projectFields, projectOperations } from './ProjectDescription';
+import { userFields, userOperations } from './UserDescription';
 import { workflowFields, workflowOperations } from './WorkflowDescription';
 import { searchWorkflows } from './WorkflowLocator';
 
@@ -15,7 +17,7 @@ export class N8n implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'n8n',
 		name: 'n8n',
-		icon: 'file:n8n.svg',
+		icon: 'node:n8n',
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
@@ -59,6 +61,14 @@ export class N8n implements INodeType {
 						value: 'execution',
 					},
 					{
+						name: 'Project',
+						value: 'project',
+					},
+					{
+						name: 'User',
+						value: 'user',
+					},
+					{
 						name: 'Workflow',
 						value: 'workflow',
 					},
@@ -74,6 +84,12 @@ export class N8n implements INodeType {
 
 			...executionOperations,
 			...executionFields,
+
+			...projectOperations,
+			...projectFields,
+
+			...userOperations,
+			...userFields,
 
 			...workflowOperations,
 			...workflowFields,

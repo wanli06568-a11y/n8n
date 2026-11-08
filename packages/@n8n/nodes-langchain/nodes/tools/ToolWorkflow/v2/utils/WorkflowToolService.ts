@@ -8,7 +8,6 @@ import { getCurrentWorkflowInputData } from 'n8n-nodes-base/dist/utils/workflowI
 import type {
 	ExecuteWorkflowData,
 	ExecutionError,
-	FromAIArgument,
 	IDataObject,
 	IExecuteFunctions,
 	IExecuteWorkflowInfo,
@@ -21,15 +20,16 @@ import type {
 	ResourceMapperValue,
 } from 'n8n-workflow';
 import {
-	generateZodSchema,
 	jsonParse,
 	NodeConnectionTypes,
 	NodeOperationError,
 	parseErrorMetadata,
-	sleepWithAbort,
-	traverseNodeParameters,
 } from 'n8n-workflow';
-import { z } from 'zod';
+
+import { createZodSchemaFromArgs, extractFromAIParameters, logAiEvent } from '@n8n/ai-utilities';
+import { sleep } from '@n8n/utils/sleep';
+
+import { SUB_WORKFLOW_WAITING_PLACEHOLDER } from '../../constants';
 
 function isNodeExecutionData(data: unknown): data is INodeExecutionData[] {
 	return isArray(data) && Boolean(data.length) && isObject(data[0]) && 'json' in data[0];
@@ -97,6 +97,21 @@ export class WorkflowToolService {
 			}
 
 			let lastError: ExecutionError | undefined;
+			const cancelledResponse = 'There was an error: "Execution was cancelled"';
+
+			const emitCancelledToolCall = (
+				loggingContext: ISupplyDataFunctions | IExecuteFunctions,
+				outputRunIndex: number,
+			) => {
+				if (!manualLogging) {
+					return;
+				}
+				const cancelledData: INodeExecutionData[] = [{ json: { error: cancelledResponse } }];
+				void loggingContext.addOutputData(NodeConnectionTypes.AiTool, outputRunIndex, [
+					cancelledData,
+				]);
+				logAiEvent(loggingContext, 'ai-tool-called', { query, response: cancelledResponse });
+			};
 
 			for (let tryIndex = 0; tryIndex < maxTries; tryIndex++) {
 				const localRunIndex = runIndex++;
@@ -117,7 +132,8 @@ export class WorkflowToolService {
 
 				// Check if execution was cancelled before retry
 				if (abortSignal?.aborted) {
-					return 'There was an error: "Execution was cancelled"';
+					emitCancelledToolCall(context, localRunIndex);
+					return cancelledResponse;
 				}
 
 				if (tryIndex !== 0) {
@@ -125,9 +141,10 @@ export class WorkflowToolService {
 					lastError = undefined;
 					if (waitBetweenTries !== 0) {
 						try {
-							await sleepWithAbort(waitBetweenTries, abortSignal);
+							await sleep(waitBetweenTries, abortSignal);
 						} catch (abortError) {
-							return 'There was an error: "Execution was cancelled"';
+							emitCancelledToolCall(context, localRunIndex);
+							return cancelledResponse;
 						}
 					}
 				}
@@ -169,17 +186,22 @@ export class WorkflowToolService {
 							[responseData],
 							metadata,
 						);
-
+						logAiEvent(context, 'ai-tool-called', { query, response: processedResponse });
 						return processedResponse;
 					}
-
 					// If manualLogging is false we've been called by the engine and need
 					// the structured response.
+
+					if (metadata && 'setMetadata' in context) {
+						void context.setMetadata(metadata);
+					}
+
 					return responseData;
 				} catch (error) {
 					// Check if error is due to cancellation
 					if (abortSignal?.aborted) {
-						return 'There was an error: "Execution was cancelled"';
+						emitCancelledToolCall(context, localRunIndex);
+						return cancelledResponse;
 					}
 
 					const executionError = error as ExecutionError;
@@ -188,15 +210,27 @@ export class WorkflowToolService {
 
 					if (manualLogging) {
 						const metadata = parseErrorMetadata(error);
+						// Wrap error in INodeExecutionData format so it can be properly processed
+						// by buildSteps and displayed in the UI execution data
+						const errorData: INodeExecutionData[] = [{ json: { error: errorResponse } }];
 						void context.addOutputData(
 							NodeConnectionTypes.AiTool,
 							localRunIndex,
-							executionError,
+							[errorData],
 							metadata,
 						);
+						logAiEvent(context, 'ai-tool-called', { query, response: errorResponse });
 					}
 
 					if (tryIndex === maxTries - 1) {
+						// When called by the engine (manualLogging=false), throw so
+						// workflow-execute records the failure against this tool run.
+						// Continue-on-fail for AI tools still surfaces the error to the
+						// agent so it can iterate. The legacy agent-direct path keeps
+						// returning the error string for backwards compatibility.
+						if (!manualLogging) {
+							throw executionError;
+						}
 						return errorResponse;
 					}
 				}
@@ -207,7 +241,7 @@ export class WorkflowToolService {
 
 		// Create structured tool if input schema is provided
 		return this.useSchema
-			? await this.createStructuredTool(name, description, toolHandler)
+			? this.createStructuredTool(name, description, toolHandler)
 			: new DynamicTool({ name, description, func: toolHandler });
 	}
 
@@ -253,12 +287,23 @@ export class WorkflowToolService {
 				parentExecution: {
 					executionId: workflowProxy.$execution.id,
 					workflowId: workflowProxy.$workflow.id,
+					shouldResume: true,
 				},
+				returnLastRunOnly: true, // The tool's answer is the sub-workflow's final-run output, not its internal multi-run computation.
 			});
 			// Set sub-workflow execution id so it can be used in other places
 			this.subExecutionId = receivedData.executionId;
 		} catch (error) {
 			throw new NodeOperationError(context.getNode(), error as Error);
+		}
+		if (receivedData.waitTill) {
+			// A parked child has no final output yet: Wait / Send-and-Wait nodes pass their input
+			// through, so `data` is the HITL node's input, not a result. The parent is already parked
+			// via BaseExecuteContext.executeWorkflow and gets the real output on resume.
+			const response = this.returnAllItems
+				? [{ json: SUB_WORKFLOW_WAITING_PLACEHOLDER }]
+				: SUB_WORKFLOW_WAITING_PLACEHOLDER;
+			return { response, subExecutionId: receivedData.executionId };
 		}
 
 		let response: IDataObject | INodeExecutionData[] | undefined;
@@ -404,44 +449,24 @@ export class WorkflowToolService {
 	/**
 	 *  Create structured tool by parsing the sub-workflow input schema
 	 */
-	private async createStructuredTool(
+	private createStructuredTool(
 		name: string,
 		description: string,
 		func: (
 			query: string | IDataObject,
 			runManager?: CallbackManagerForToolRun,
 		) => Promise<string | IDataObject | IDataObject[]>,
-	): Promise<DynamicStructuredTool | DynamicTool> {
-		const collectedArguments = await this.extractFromAIParameters();
+	): DynamicStructuredTool | DynamicTool {
+		const collectedArguments = extractFromAIParameters(this.baseContext.getNode().parameters);
 
 		// If there are no `fromAI` arguments, fallback to creating a simple tool
 		if (collectedArguments.length === 0) {
 			return new DynamicTool({ name, description, func });
 		}
 
-		// Otherwise, prepare Zod schema  and create a structured tool
-		const schema = this.createZodSchema(collectedArguments);
+		// Prepare Zod schema for the structured tool
+		const schema = createZodSchemaFromArgs(collectedArguments);
+
 		return new DynamicStructuredTool({ schema, name, description, func });
-	}
-
-	private async extractFromAIParameters(): Promise<FromAIArgument[]> {
-		const collectedArguments: FromAIArgument[] = [];
-		traverseNodeParameters(this.baseContext.getNode().parameters, collectedArguments);
-
-		const uniqueArgsMap = new Map<string, FromAIArgument>();
-		for (const arg of collectedArguments) {
-			uniqueArgsMap.set(arg.key, arg);
-		}
-
-		return Array.from(uniqueArgsMap.values());
-	}
-
-	private createZodSchema(args: FromAIArgument[]): z.ZodObject<any> {
-		const schemaObj = args.reduce((acc: Record<string, z.ZodTypeAny>, placeholder) => {
-			acc[placeholder.key] = generateZodSchema(placeholder);
-			return acc;
-		}, {});
-
-		return z.object(schemaObj).required();
 	}
 }

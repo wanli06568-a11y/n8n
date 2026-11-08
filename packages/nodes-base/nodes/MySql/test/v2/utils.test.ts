@@ -1,9 +1,11 @@
-import type { INode } from 'n8n-workflow';
+import { mock } from 'vitest-mock-extended';
+import type { IExecuteFunctions, INode } from 'n8n-workflow';
 
-import type { SortRule, WhereClause } from '../../v2/helpers/interfaces';
+import type { QueryValues, SortRule, WhereClause } from '../../v2/helpers/interfaces';
 import * as utils from '../../v2/helpers/utils';
 import {
 	prepareQueryAndReplacements,
+	prepareSafeQuery,
 	wrapData,
 	addWhereClauses,
 	addSortRules,
@@ -109,34 +111,31 @@ describe('Test MySql V2, prepareQueryAndReplacements', () => {
 		);
 	});
 
-	it('should handle escaped double quotes correctly', () => {
+	it('should not treat a double quote inside a single-quoted string as closing it', () => {
 		const preparedQuery = prepareQueryAndReplacements(
-			"INSERT INTO test_table(content) VALUES('Don\"'t replace $1 here')",
+			"INSERT INTO test_table(content) VALUES('Don\"t replace $1 here')",
 			2.5,
 			['should_not_appear', 123],
 		);
 		expect(preparedQuery).toBeDefined();
 		expect(preparedQuery.query).toEqual(
-			"INSERT INTO test_table(content) VALUES('Don\"'t replace $1 here')",
+			"INSERT INTO test_table(content) VALUES('Don\"t replace $1 here')",
 		);
 	});
 
+	// The two code paths can't be distinguished by spying on the (sibling, ESM-bound)
+	// prepareQueryLegacy call under Vitest, so assert the observable behaviour instead:
+	// legacy processing does not validate referenced parameters, new processing does.
 	it('should use legacy processing for versions < 2.5', () => {
-		const legacySpy = jest.spyOn(utils, 'prepareQueryLegacy');
-
-		prepareQueryAndReplacements('SELECT * FROM $1:name WHERE id = $2', 2.4, ['users', 123]);
-
-		expect(legacySpy).toHaveBeenCalledWith('SELECT * FROM $1:name WHERE id = $2', ['users', 123]);
-
-		legacySpy.mockRestore();
+		expect(() =>
+			prepareQueryAndReplacements('SELECT * FROM users WHERE id = $4', 2.4, ['value1', 'value2']),
+		).not.toThrow();
 	});
 
 	it('should use new processing for versions >= 2.5', () => {
-		const legacySpy = jest.spyOn(utils, 'prepareQueryLegacy');
-
-		prepareQueryAndReplacements('SELECT * FROM $1:name WHERE id = $2', 2.5, ['users', 123]);
-
-		expect(legacySpy).not.toHaveBeenCalled();
+		expect(() =>
+			prepareQueryAndReplacements('SELECT * FROM users WHERE id = $4', 2.5, ['value1', 'value2']),
+		).toThrow('Parameter $4 referenced in query but no replacement value provided at index 4');
 	});
 
 	it('should throw error when parameter is referenced but no replacement value provided', () => {
@@ -167,6 +166,46 @@ describe('Test MySql V2, prepareQueryAndReplacements', () => {
 				['123', 'John'], // Correct number of values
 			);
 		}).not.toThrow();
+	});
+
+	it('should throw a clear error for a null identifier value, both legacy and current versions', () => {
+		const valuesWithNull = [null, 1] as unknown as QueryValues;
+
+		expect(() =>
+			prepareQueryAndReplacements('SELECT * FROM $1:name WHERE id = $2', 2.5, valuesWithNull),
+		).toThrow('Parameter $1 has no value to use as an identifier');
+
+		expect(() =>
+			prepareQueryAndReplacements('SELECT * FROM $1:name WHERE id = $2', 2.4, valuesWithNull),
+		).toThrow('Parameter $1 has no value to use as an identifier');
+	});
+});
+
+describe('Test MySql, prepareSafeQuery', () => {
+	it('should bind placeholders outside quotes as parameters', () => {
+		const preparedQuery = prepareSafeQuery('select * from users where id = $1', ['1 OR 1=1']);
+		expect(preparedQuery.query).toEqual('select * from users where id = ?');
+		expect(preparedQuery.values).toEqual(['1 OR 1=1']);
+	});
+
+	it('should leave placeholders inside quoted strings untouched', () => {
+		const preparedQuery = prepareSafeQuery("select * from users where label = '$5' and id = $1", [
+			'7',
+		]);
+		expect(preparedQuery.query).toEqual("select * from users where label = '$5' and id = ?");
+		expect(preparedQuery.values).toEqual(['7']);
+	});
+
+	it('should return the query unchanged when replacements are undefined', () => {
+		const preparedQuery = prepareSafeQuery('select * from users where id = $1');
+		expect(preparedQuery.query).toEqual('select * from users where id = $1');
+		expect(preparedQuery.values).toEqual([]);
+	});
+
+	it('should throw when a referenced parameter has no replacement value', () => {
+		expect(() => prepareSafeQuery('select * from users where id = $1', [])).toThrow(
+			'Parameter $1 referenced in query but no replacement value provided at index 1',
+		);
 	});
 });
 
@@ -332,5 +371,109 @@ describe('Test MySql V2, splitQueryToStatements', () => {
 		expect(statements).toEqual([
 			"SELECT custom_ship_time FROM models WHERE models.custom_ship_time LIKE CONCAT('%', ';', '%') LIMIT 10",
 		]);
+	});
+
+	describe('where clause handling', () => {
+		const validOperations = [
+			'equal',
+			'=',
+			'!=',
+			'LIKE',
+			'>',
+			'<',
+			'>=',
+			'<=',
+			'IS NULL',
+			'IS NOT NULL',
+		];
+		const invalidOperations = ['=1 or 1--', '=>', ''];
+
+		test.each(validOperations)('isWhereClause returns true for "%s" operation', (operation) => {
+			expect(
+				utils.isWhereClause({
+					column: 'id',
+					condition: operation,
+					value: '1',
+				}),
+			).toBe(true);
+		});
+
+		test.each(invalidOperations)('isWhereClause returns false for "%s" operation', (operation) => {
+			expect(
+				utils.isWhereClause({
+					column: 'name',
+					condition: operation,
+					value: 'ok',
+				}),
+			).toBe(false);
+		});
+
+		test('isWhereClause returns false for when column is missing', () => {
+			expect(
+				utils.isWhereClause({
+					condition: 'equal',
+					value: 'ok',
+				}),
+			).toBe(false);
+		});
+
+		test('isWhereClause returns false for when condition is missing', () => {
+			expect(
+				utils.isWhereClause({
+					column: 'id',
+					value: 'ok',
+				}),
+			).toBe(false);
+		});
+
+		test.each(invalidOperations)(
+			'getWhereClauses throws an exception for "%s" operation',
+			(operation) => {
+				const getNodeParameterMock = vi.fn().mockReturnValue({
+					values: [
+						{
+							column: 'test',
+							condition: '=',
+							value: '3',
+						},
+						{
+							column: 'id',
+							condition: operation,
+							value: '1',
+						},
+					],
+				});
+				const ctx = mock<IExecuteFunctions>({ getNodeParameter: getNodeParameterMock });
+				expect(() => utils.getWhereClauses(ctx, 0)).toThrow();
+			},
+		);
+
+		test.each(validOperations)(
+			'getWhereClauses returns valid clauses for "%s" operation',
+			(operation) => {
+				const clauses = [
+					{
+						column: 'name',
+						condition: 'LIKE',
+						value: 'Wohn Jick',
+					},
+					{
+						column: 'id',
+						condition: operation,
+						value: '1',
+					},
+					{
+						column: 'condition',
+						condition: 'equal',
+						value: 'angry',
+					},
+				];
+				const getNodeParameterMock = vi.fn().mockReturnValue({
+					values: clauses,
+				});
+				const ctx = mock<IExecuteFunctions>({ getNodeParameter: getNodeParameterMock });
+				expect(utils.getWhereClauses(ctx, 0)).toBe(clauses);
+			},
+		);
 	});
 });

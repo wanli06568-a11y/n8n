@@ -6,6 +6,7 @@ import { NodeConnectionTypes } from 'n8n-workflow';
 import { setActivePinia } from 'pinia';
 import CanvasEdge, { type CanvasEdgeProps } from './CanvasEdge.vue';
 import type { CanvasConnectionPort } from '../../../canvas.types';
+import { createCanvasProvide } from '@/features/workflows/canvas/__tests__/utils';
 
 const DEFAULT_PROPS = {
 	sourceX: 0,
@@ -22,6 +23,11 @@ const DEFAULT_PROPS = {
 } satisfies Partial<CanvasEdgeProps>;
 const renderComponent = createComponentRenderer(CanvasEdge, {
 	props: DEFAULT_PROPS,
+	global: {
+		provide: {
+			...createCanvasProvide(),
+		},
+	},
 });
 
 beforeEach(() => {
@@ -59,6 +65,29 @@ describe('CanvasEdge', () => {
 		expect(emitted()).toHaveProperty('add');
 	});
 
+	it('routes the emit payload through resolveCanonicalConnection', async () => {
+		const canonical = {
+			source: 'real-source-id',
+			target: 'real-target-id',
+			sourceHandle: 'outputs/main/0',
+			targetHandle: 'inputs/main/0',
+		};
+		const { emitted, getByTestId } = renderComponent({
+			props: {
+				source: 'group:g1',
+				target: 'real-target-id',
+				sourceHandleId: 'right',
+				targetHandleId: 'inputs/main/0',
+				data: { ...DEFAULT_PROPS.data, canonicals: [canonical] },
+				hovered: true,
+			},
+		});
+		await userEvent.hover(getByTestId('edge-label'));
+		await userEvent.click(getByTestId('delete-connection-button'));
+
+		expect(emitted().delete[0]).toEqual([canonical]);
+	});
+
 	it('should not render toolbar actions when readOnly', async () => {
 		const { getByTestId } = renderComponent({
 			props: {
@@ -72,7 +101,7 @@ describe('CanvasEdge', () => {
 		expect(() => getByTestId('delete-connection-button')).toThrow();
 	});
 
-	it('should hide toolbar after delay', async () => {
+	it('should clear the edge hover on leave and hide the toolbar after a short grace period', async () => {
 		vi.useFakeTimers();
 
 		const user = userEvent.setup({
@@ -89,9 +118,11 @@ describe('CanvasEdge', () => {
 		await rerender({ hovered: false });
 
 		await user.unhover(getByTestId('edge-label'));
+		expect(document.querySelector('.vue-flow__edge-path')).not.toHaveClass('hovered');
 		expect(getByTestId('canvas-edge-toolbar')).toBeInTheDocument();
+		expect(getByTestId('edge-label')).toHaveStyle({ zIndex: '1' });
 
-		await vi.advanceTimersByTimeAsync(600);
+		await vi.advanceTimersByTimeAsync(150);
 
 		expect(queryByTestId('canvas-edge-toolbar')).not.toBeInTheDocument();
 	});

@@ -14,9 +14,13 @@ describe('RunExecutionDataFactory', () => {
 			const result = createRunExecutionData();
 
 			expect(result).toEqual({
+				version: 1,
 				startData: {},
 				manualData: undefined,
 				parentExecution: undefined,
+				pushRef: undefined,
+				resumeToken: expect.stringMatching(/^[a-f0-9]{64}$/),
+				waitTill: undefined,
 				resultData: {
 					error: undefined,
 					runData: {},
@@ -38,7 +42,7 @@ describe('RunExecutionDataFactory', () => {
 			const options = {
 				startData: {
 					startNodes: [{ name: 'Start', sourceData: { previousNode: 'Previous' } }],
-					destinationNode: 'End',
+					destinationNode: { nodeName: 'End', mode: 'inclusive' },
 				},
 				resultData: {
 					runData: { testNode: [] },
@@ -46,12 +50,18 @@ describe('RunExecutionDataFactory', () => {
 				},
 				executionData: {
 					nodeExecutionStack: [{ node: {} as INode, data: {}, source: null }],
+					runtimeData: {
+						version: 1 as const,
+						establishedAt: 1234567890,
+						source: 'webhook' as const,
+						credentials: 'test-credentials',
+					},
 				},
 				parentExecution: {
 					executionId: 'parent-123',
 					workflowId: 'workflow-456',
 				},
-				validateSignature: true,
+				resumeToken: 'custom-token-for-test',
 				waitTill: new Date('2023-01-01'),
 			} satisfies CreateFullRunExecutionDataOptions;
 
@@ -63,8 +73,9 @@ describe('RunExecutionDataFactory', () => {
 			expect(result.executionData?.nodeExecutionStack).toEqual(
 				options.executionData.nodeExecutionStack,
 			);
+			expect(result.executionData?.runtimeData).toEqual(options.executionData.runtimeData);
 			expect(result.parentExecution).toEqual(options.parentExecution);
-			expect(result.validateSignature).toBe(true);
+			expect(result.resumeToken).toBe('custom-token-for-test');
 			expect(result.waitTill).toEqual(options.waitTill);
 		});
 
@@ -76,6 +87,13 @@ describe('RunExecutionDataFactory', () => {
 			expect(result.executionData).toBeUndefined();
 			expect(result.startData).toEqual({});
 			expect(result.resultData.runData).toEqual({});
+		});
+
+		it('preserves the sub-workflow output policy through serialization and reconstruction', () => {
+			const data = createRunExecutionData({ subWorkflowOutput: { lastRunOnly: true } });
+			const saved: CreateFullRunExecutionDataOptions = JSON.parse(JSON.stringify(data));
+			expect(createRunExecutionData(saved).subWorkflowOutput).toEqual({ lastRunOnly: true });
+			expect(createRunExecutionData().subWorkflowOutput).toBeUndefined();
 		});
 
 		it('should omit `resultData.runData` if null is passed', () => {
@@ -102,6 +120,7 @@ describe('RunExecutionDataFactory', () => {
 			const result = createEmptyRunExecutionData();
 
 			expect(result).toEqual({
+				version: 1,
 				resultData: {
 					runData: {},
 				},
@@ -127,7 +146,10 @@ describe('RunExecutionDataFactory', () => {
 
 			const result = createErrorExecutionData(node, error);
 
-			expect(result.startData?.destinationNode).toBe('TestNode');
+			expect(result.startData?.destinationNode).toEqual({
+				nodeName: 'TestNode',
+				mode: 'inclusive',
+			});
 			expect(result.startData?.runNodeFilter).toEqual(['TestNode']);
 
 			expect(result.executionData?.contextData).toEqual({});

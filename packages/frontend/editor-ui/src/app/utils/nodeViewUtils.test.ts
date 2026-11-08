@@ -7,11 +7,17 @@ import {
 	generateOffsets,
 	getGenericHints,
 	getNewNodePosition,
+	getNodeViewTab,
 	updateViewportToContainNodes,
 	DEFAULT_NODE_SIZE,
 	snapPositionToGrid,
+	snapToGrid,
 	calculateNodeSize,
 	GRID_SIZE,
+	NODE_X_SPACING,
+	HORIZONTAL_NODE_STEP,
+	doRectsOverlap,
+	canUsePosition,
 } from './nodeViewUtils';
 import type { INode, INodeTypeDescription, INodeExecutionData, Workflow } from 'n8n-workflow';
 import type { INodeUi, XYPosition } from '@/Interface';
@@ -25,6 +31,8 @@ import type { GraphNode } from '@vue-flow/core';
 import { v4 as uuid } from 'uuid';
 import { createTestingPinia } from '@pinia/testing';
 import { setActivePinia } from 'pinia';
+import { MAIN_HEADER_TABS, VIEWS } from '@/app/constants';
+import type { RouteLocation } from 'vue-router';
 
 describe('getGenericHints', () => {
 	let mockWorkflowNode: MockProxy<INode>;
@@ -61,7 +69,7 @@ describe('getGenericHints', () => {
 			nodeOutputData: mockNodeOutputData,
 			hasMultipleInputItems,
 			hasNodeRun,
-			nodes: {},
+			getNodeByName: () => null,
 			connections: {},
 		});
 
@@ -87,7 +95,7 @@ describe('getGenericHints', () => {
 			nodeOutputData: mockNodeOutputData,
 			hasMultipleInputItems,
 			hasNodeRun,
-			nodes: {},
+			getNodeByName: () => null,
 			connections: {},
 		});
 
@@ -126,7 +134,7 @@ describe('getGenericHints', () => {
 			nodeOutputData: mockNodeOutputData,
 			hasMultipleInputItems,
 			hasNodeRun,
-			nodes: {},
+			getNodeByName: () => null,
 			connections: {},
 		});
 
@@ -151,7 +159,7 @@ describe('getGenericHints', () => {
 			nodeOutputData: mockNodeOutputData,
 			hasMultipleInputItems,
 			hasNodeRun,
-			nodes: {},
+			getNodeByName: () => null,
 			connections: {},
 		});
 
@@ -176,7 +184,7 @@ describe('getGenericHints', () => {
 			nodeOutputData: mockNodeOutputData,
 			hasMultipleInputItems,
 			hasNodeRun,
-			nodes: {},
+			getNodeByName: () => null,
 			connections: {},
 		});
 
@@ -202,7 +210,7 @@ describe('getGenericHints', () => {
 			nodeOutputData: mockNodeOutputData,
 			hasMultipleInputItems,
 			hasNodeRun,
-			nodes: {},
+			getNodeByName: () => null,
 			connections: {},
 		});
 
@@ -251,7 +259,13 @@ describe('snapPositionToGrid', () => {
 	it('should snap position to grid', () => {
 		const position: XYPosition = [105, 115];
 		const snappedPosition = snapPositionToGrid(position);
-		expect(snappedPosition).toEqual([112, 128]);
+		expect(snappedPosition).toEqual([112, 112]);
+	});
+
+	it('should snap a negative midpoint to the nearest grid line like snapToGrid', () => {
+		const position: XYPosition = [-24, -24];
+		const snappedPosition = snapPositionToGrid(position);
+		expect(snappedPosition).toEqual([-16, -16]);
 	});
 
 	it('should not change position if already on grid', () => {
@@ -267,6 +281,16 @@ describe('snapPositionToGrid', () => {
 	});
 });
 
+describe('snapToGrid', () => {
+	it('should return 0 and not -0 for a small negative value', () => {
+		expect(snapToGrid(-8)).toBe(0);
+	});
+
+	it('should keep NaN', () => {
+		expect(snapToGrid(Number.NaN)).toBeNaN();
+	});
+});
+
 describe('getNewNodePosition', () => {
 	it('should return the new position when there are no conflicts', () => {
 		const nodes: INodeUi[] = [];
@@ -279,7 +303,7 @@ describe('getNewNodePosition', () => {
 		const nodes: INodeUi[] = [];
 		const newPosition: XYPosition = [105, 115];
 		const result = getNewNodePosition(nodes, newPosition);
-		expect(result).toEqual([112, 128]);
+		expect(result).toEqual([112, 112]);
 	});
 
 	it('should move the position to avoid conflicts', () => {
@@ -287,6 +311,13 @@ describe('getNewNodePosition', () => {
 		const newPosition: XYPosition = [96, 96];
 		const result = getNewNodePosition(nodes, newPosition);
 		expect(result).toEqual([240, 240]);
+	});
+
+	it('should move by at least one grid cell when the offset is smaller than half a cell', () => {
+		const nodes: INodeUi[] = [createTestNode({ id: '1', position: [96, 96], type: SET_NODE_TYPE })];
+		const newPosition: XYPosition = [96, 96];
+		const result = getNewNodePosition(nodes, newPosition, { offset: [7, 7] });
+		expect(result).toEqual([208, 208]);
 	});
 
 	it('should skip nodes in the conflict allowlist', () => {
@@ -575,3 +606,119 @@ function createTestGraphNode(data: Partial<GraphNode> = {}): GraphNode {
 		...data,
 	};
 }
+
+describe('doRectsOverlap', () => {
+	it('should return true when rectangles overlap', () => {
+		const rect1 = { x: 0, y: 0, width: 100, height: 100 };
+		const rect2 = { x: 50, y: 50, width: 100, height: 100 };
+		expect(doRectsOverlap(rect1, rect2)).toBe(true);
+	});
+
+	it('should return false when rectangles do not overlap horizontally', () => {
+		const rect1 = { x: 0, y: 0, width: 100, height: 100 };
+		const rect2 = { x: 150, y: 0, width: 100, height: 100 };
+		expect(doRectsOverlap(rect1, rect2)).toBe(false);
+	});
+
+	it('should return false when rectangles do not overlap vertically', () => {
+		const rect1 = { x: 0, y: 0, width: 100, height: 100 };
+		const rect2 = { x: 0, y: 150, width: 100, height: 100 };
+		expect(doRectsOverlap(rect1, rect2)).toBe(false);
+	});
+
+	it('should return false when rectangles touch but do not overlap', () => {
+		const rect1 = { x: 0, y: 0, width: 100, height: 100 };
+		const rect2 = { x: 100, y: 0, width: 100, height: 100 };
+		expect(doRectsOverlap(rect1, rect2)).toBe(false);
+	});
+
+	it('should return true when one rectangle contains another', () => {
+		const rect1 = { x: 0, y: 0, width: 200, height: 200 };
+		const rect2 = { x: 50, y: 50, width: 50, height: 50 };
+		expect(doRectsOverlap(rect1, rect2)).toBe(true);
+	});
+});
+
+describe('canUsePosition', () => {
+	it('should return true when positions are far apart', () => {
+		const pos1: XYPosition = [0, 0];
+		const pos2: XYPosition = [200, 200];
+		expect(canUsePosition(pos1, pos2)).toBe(true);
+	});
+
+	it('should return false when positions overlap', () => {
+		const pos1: XYPosition = [0, 0];
+		const pos2: XYPosition = [50, 50];
+		expect(canUsePosition(pos1, pos2)).toBe(false);
+	});
+
+	it('should return true when positions are separated horizontally', () => {
+		const pos1: XYPosition = [0, 0];
+		const pos2: XYPosition = [DEFAULT_NODE_SIZE[0] + 1, 0];
+		expect(canUsePosition(pos1, pos2)).toBe(true);
+	});
+
+	it('should return true when positions are separated vertically', () => {
+		const pos1: XYPosition = [0, 0];
+		const pos2: XYPosition = [0, DEFAULT_NODE_SIZE[1] + 1];
+		expect(canUsePosition(pos1, pos2)).toBe(true);
+	});
+});
+
+describe('getNodeViewTab', () => {
+	function createRouteLocation(overrides: Partial<RouteLocation>): RouteLocation {
+		return {
+			matched: [],
+			fullPath: '/',
+			query: {},
+			hash: '',
+			redirectedFrom: undefined,
+			path: '/',
+			params: {},
+			name: undefined,
+			meta: {},
+			...overrides,
+		} as RouteLocation;
+	}
+
+	it('should return WORKFLOW for routes with nodeView meta', () => {
+		const route = createRouteLocation({ meta: { nodeView: true } });
+		expect(getNodeViewTab(route)).toBe(MAIN_HEADER_TABS.WORKFLOW);
+	});
+
+	it.each([VIEWS.WORKFLOW_EXECUTIONS, VIEWS.EXECUTION_PREVIEW, VIEWS.EXECUTION_HOME])(
+		'should return EXECUTIONS for %s route',
+		(viewName) => {
+			const route = createRouteLocation({ name: viewName });
+			expect(getNodeViewTab(route)).toBe(MAIN_HEADER_TABS.EXECUTIONS);
+		},
+	);
+
+	it.each([VIEWS.EVALUATION_EDIT, VIEWS.EVALUATION_RUNS_DETAIL])(
+		'should return EVALUATION for %s route',
+		(viewName) => {
+			const route = createRouteLocation({ name: viewName });
+			expect(getNodeViewTab(route)).toBe(MAIN_HEADER_TABS.EVALUATION);
+		},
+	);
+
+	it('should return null for unrecognized routes', () => {
+		const route = createRouteLocation({ name: 'SomeOtherView' });
+		expect(getNodeViewTab(route)).toBeNull();
+	});
+});
+
+describe('horizontal spacing constants', () => {
+	it('should keep the placement step in lockstep with the auto-layout node step', () => {
+		// The plus button / connection-drop places a node HORIZONTAL_NODE_STEP to the
+		// right of its source; the cleanup auto-layout leaves NODE_X_SPACING between
+		// adjacent node edges. They must agree so a freshly placed node lands exactly
+		// where cleanup would put it (see CAT-2395).
+		expect(HORIZONTAL_NODE_STEP).toBe(DEFAULT_NODE_SIZE[0] + NODE_X_SPACING);
+	});
+
+	it('should resolve to the canonical 8-dot step (224px on a 16px grid)', () => {
+		expect(NODE_X_SPACING).toBe(GRID_SIZE * 8);
+		expect(HORIZONTAL_NODE_STEP).toBe(224);
+	});
+});

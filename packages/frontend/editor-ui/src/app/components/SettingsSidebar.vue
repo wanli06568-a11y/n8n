@@ -1,201 +1,121 @@
 <script lang="ts" setup>
-import { useUserHelpers } from '@/app/composables/useUserHelpers';
-import { ABOUT_MODAL_KEY, SSO_JUST_IN_TIME_PROVSIONING_EXPERIMENT, VIEWS } from '@/app/constants';
-import { usePostHog } from '@/app/stores/posthog.store';
-import { useSettingsStore } from '@/app/stores/settings.store';
-import { useUIStore } from '@/app/stores/ui.store';
-import { hasPermission } from '@/app/utils/rbac/permissions';
+import { onMounted } from 'vue';
+import { ABOUT_MODAL_KEY } from '@/app/constants';
+
+import { N8nIcon, N8nLink, N8nMenuItem, N8nScrollArea, N8nText } from '@n8n/design-system';
+import { useSettingsItems } from '../composables/useSettingsItems';
+import { useAiGateway } from '../composables/useAiGateway';
 import { useI18n } from '@n8n/i18n';
 import { useRootStore } from '@n8n/stores/useRootStore';
-import { computed } from 'vue';
-import { useRouter } from 'vue-router';
+import { useUIStore } from '../stores/ui.store';
 
-import { N8nIcon, N8nLink, N8nMenuItem, N8nText, type IMenuItem } from '@n8n/design-system';
 const emit = defineEmits<{
 	return: [];
 }>();
 
-const router = useRouter();
 const i18n = useI18n();
-
-const { canUserAccessRouteByName } = useUserHelpers(router);
-
 const rootStore = useRootStore();
-const settingsStore = useSettingsStore();
-const posthogStore = usePostHog();
 const uiStore = useUIStore();
 
-const sidebarMenuItems = computed<IMenuItem[]>(() => {
-	const menuItems: IMenuItem[] = [
-		{
-			id: 'settings-usage-and-plan',
-			icon: 'chart-column-decreasing',
-			label: i18n.baseText('settings.usageAndPlan.title'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.USAGE),
-			route: { to: { name: VIEWS.USAGE } },
-		},
-		{
-			id: 'settings-personal',
-			icon: 'circle-user-round',
-			label: i18n.baseText('settings.personal'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.PERSONAL_SETTINGS),
-			route: { to: { name: VIEWS.PERSONAL_SETTINGS } },
-		},
-		{
-			id: 'settings-users',
-			icon: 'user-round',
-			label: i18n.baseText('settings.users'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.USERS_SETTINGS),
-			route: { to: { name: VIEWS.USERS_SETTINGS } },
-		},
-		{
-			id: 'settings-project-roles',
-			icon: 'user-round',
-			label: i18n.baseText('settings.projectRoles'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.PROJECT_ROLES_SETTINGS),
-			route: { to: { name: VIEWS.PROJECT_ROLES_SETTINGS } },
-		},
-		{
-			id: 'settings-api',
-			icon: 'plug',
-			label: i18n.baseText('settings.n8napi'),
-			position: 'top',
-			available: settingsStore.isPublicApiEnabled && canUserAccessRouteByName(VIEWS.API_SETTINGS),
-			route: { to: { name: VIEWS.API_SETTINGS } },
-		},
-		{
-			id: 'settings-external-secrets',
-			icon: 'vault',
-			label: i18n.baseText('settings.externalSecrets.title'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.EXTERNAL_SECRETS_SETTINGS),
-			route: { to: { name: VIEWS.EXTERNAL_SECRETS_SETTINGS } },
-		},
-		{
-			id: 'settings-source-control',
-			icon: 'git-branch',
-			label: i18n.baseText('settings.sourceControl.title'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.SOURCE_CONTROL),
-			route: { to: { name: VIEWS.SOURCE_CONTROL } },
-		},
-		{
-			id: 'settings-sso',
-			icon: 'user-lock',
-			label: i18n.baseText('settings.sso'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.SSO_SETTINGS),
-			route: { to: { name: VIEWS.SSO_SETTINGS } },
-		},
-		{
-			id: 'settings-ldap',
-			icon: 'network',
-			label: i18n.baseText('settings.ldap'),
-			position: 'top',
-			available: canUserAccessRouteByName(VIEWS.LDAP_SETTINGS),
-			route: { to: { name: VIEWS.LDAP_SETTINGS } },
-		},
-		{
-			id: 'settings-provisioning',
-			icon: 'toolbox',
-			label: i18n.baseText('settings.provisioning.title'),
-			position: 'top',
-			available:
-				canUserAccessRouteByName(VIEWS.PROVISIONING_SETTINGS) &&
-				// TODO: comment this back one once posthog experiment is done: settingsStore.isEnterpriseFeatureEnabled.provisioning,
-				posthogStore.isFeatureEnabled(SSO_JUST_IN_TIME_PROVSIONING_EXPERIMENT.name),
-			route: { to: { name: VIEWS.PROVISIONING_SETTINGS } },
-		},
-		{
-			id: 'settings-workersview',
-			icon: 'waypoints',
-			label: i18n.baseText('mainSidebar.workersView'),
-			position: 'top',
-			available:
-				settingsStore.isQueueModeEnabled &&
-				hasPermission(['rbac'], { rbac: { scope: 'workersView:manage' } }),
-			route: { to: { name: VIEWS.WORKER_VIEW } },
-		},
-	];
+const { settingsSections, handleSettingsItemSelect } = useSettingsItems();
+const { fetchWallet, isEnabled } = useAiGateway();
 
-	menuItems.push({
-		id: 'settings-log-streaming',
-		icon: 'log-in',
-		label: i18n.baseText('settings.log-streaming'),
-		position: 'top',
-		available: canUserAccessRouteByName(VIEWS.LOG_STREAMING_SETTINGS),
-		route: { to: { name: VIEWS.LOG_STREAMING_SETTINGS } },
-	});
-
-	menuItems.push({
-		id: 'settings-community-nodes',
-		icon: 'box',
-		label: i18n.baseText('settings.communityNodes'),
-		position: 'top',
-		available: canUserAccessRouteByName(VIEWS.COMMUNITY_NODES),
-		route: { to: { name: VIEWS.COMMUNITY_NODES } },
-	});
-
-	menuItems.push({
-		id: 'settings-migration-report',
-		icon: 'list-checks',
-		label: i18n.baseText('settings.migrationReport'),
-		position: 'top',
-		available: canUserAccessRouteByName(VIEWS.MIGRATION_REPORT),
-		route: { to: { name: VIEWS.MIGRATION_REPORT } },
-	});
-
-	// Append module-registered settings sidebar items.
-	const moduleItems = uiStore.settingsSidebarItems;
-
-	return menuItems.concat(moduleItems.filter((item) => !menuItems.some((m) => m.id === item.id)));
+onMounted(() => {
+	if (isEnabled.value) void fetchWallet();
 });
-
-const visibleItems = computed(() => sidebarMenuItems.value.filter((item) => item.available));
 </script>
 
 <template>
 	<div :class="$style.container">
-		<div :class="$style.returnButton" data-test-id="settings-back" @click="emit('return')">
-			<i>
-				<N8nIcon icon="arrow-left" />
-			</i>
-			<N8nText bold>{{ i18n.baseText('settings') }}</N8nText>
+		<div :class="$style.returnBar">
+			<div :class="$style.returnButton" data-test-id="settings-back" @click="emit('return')">
+				<div :class="$style.arrowIcon">
+					<N8nIcon icon="arrow-left" size="small" />
+				</div>
+				<N8nText bold>{{ i18n.baseText('settings') }}</N8nText>
+			</div>
 		</div>
-		<div :class="$style.items">
-			<N8nMenuItem v-for="item in visibleItems" :key="item.id" :item="item" />
-		</div>
-		<div :class="$style.versionContainer">
-			<N8nLink size="small" @click="uiStore.openModal(ABOUT_MODAL_KEY)">
-				{{ i18n.baseText('settings.version') }} {{ rootStore.versionCli }}
-			</N8nLink>
-		</div>
+		<!-- The back link stays put; only the links scroll, with faded edges showing there is more. -->
+		<N8nScrollArea edge-fade="y" :class="$style.scrollArea" data-test-id="settings-sidebar-scroll">
+			<div :class="$style.items">
+				<div
+					v-for="section in settingsSections"
+					:key="section.id"
+					:class="$style.section"
+					:data-test-id="`settings-section-${section.id}`"
+				>
+					<N8nText
+						v-if="section.title"
+						tag="div"
+						size="small"
+						bold
+						color="text-light"
+						:class="$style.sectionTitle"
+					>
+						{{ section.title }}
+					</N8nText>
+					<N8nMenuItem
+						v-for="item in section.items"
+						:key="item.id"
+						:item="item"
+						@click="handleSettingsItemSelect(item.id)"
+					/>
+				</div>
+			</div>
+			<div :class="$style.versionContainer">
+				<N8nLink size="small" @click="uiStore.openModal(ABOUT_MODAL_KEY)">
+					{{ i18n.baseText('settings.version') }} {{ rootStore.versionCli }}
+				</N8nLink>
+			</div>
+		</N8nScrollArea>
 	</div>
 </template>
 
 <style lang="scss" module>
+@use '@/app/css/variables' as *;
+
 .container {
 	min-width: $sidebar-expanded-width;
 	height: 100%;
 	background-color: var(--color--background--light-3);
 	border-right: var(--border);
 	position: relative;
-	overflow: auto;
+	/* Grid rows are definite once sized, so the scroll area can fill the rest and scroll. */
+	display: grid;
+	grid-template-rows: auto minmax(0, 1fr);
+	overflow: hidden;
+}
+
+.scrollArea {
+	min-height: 0;
+}
+
+.returnBar {
+	/* Same horizontal inset as the links below, so the hover pill lines up with theirs. */
+	padding: var(--spacing--2xs) var(--spacing--3xs);
+	border-bottom: var(--border);
 }
 
 .returnButton {
-	padding: var(--spacing--xs);
-	cursor: pointer;
+	/* Mirrors the N8nMenuItem box and hover so the back link reads as part of the list. */
 	display: flex;
-	gap: var(--spacing--3xs);
 	align-items: center;
+	gap: var(--spacing--4xs);
+	height: var(--spacing--xl);
+	padding: var(--spacing--4xs);
+	border-radius: var(--radius);
+	cursor: pointer;
+
+	.arrowIcon {
+		display: grid;
+		place-items: center;
+		width: var(--spacing--lg);
+		height: var(--spacing--lg);
+	}
 
 	&:hover {
-		color: var(--color--primary);
+		background-color: var(--color--background--light-1);
+		color: var(--color--text--shade-1);
 	}
 }
 
@@ -203,11 +123,26 @@ const visibleItems = computed(() => sidebarMenuItems.value.filter((item) => item
 	display: flex;
 	flex-direction: column;
 
-	padding: 0 var(--spacing--3xs);
+	padding: var(--spacing--xs) var(--spacing--3xs) 0;
+}
+
+.section {
+	display: flex;
+	flex-direction: column;
+
+	& + & {
+		margin-top: var(--spacing--xs);
+	}
+}
+
+.sectionTitle {
+	padding: var(--spacing--4xs) var(--spacing--3xs);
+	margin-bottom: var(--spacing--5xs);
 }
 
 .versionContainer {
-	padding: var(--spacing--xs);
+	/* Extra bottom space keeps the version clear of the browser's link preview bar. */
+	padding: var(--spacing--xs) var(--spacing--xs) var(--spacing--xl);
 }
 
 @media screen and (max-height: 420px) {

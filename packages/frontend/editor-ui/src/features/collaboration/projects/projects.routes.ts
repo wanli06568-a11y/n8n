@@ -2,9 +2,10 @@ import type { RouteLocationNormalized, RouteRecordRaw } from 'vue-router';
 import { VIEWS } from '@/app/constants';
 import { useProjectsStore } from './projects.store';
 import { getResourcePermissions } from '@n8n/permissions';
-import { useInsightsStore } from '@/features/execution/insights/insights.store';
+import { CHAT_VIEW } from '@/features/ai/chatHub/constants';
+import { hasRole } from '@/app/utils/rbac/checks';
+import { useSettingsStore } from '@n8n/stores/settings.store';
 
-const MainSidebar = async () => await import('@/app/components/MainSidebar.vue');
 const WorkflowsView = async () => await import('@/app/views/WorkflowsView.vue');
 const CredentialsView = async () =>
 	await import('@/features/credentials/views/CredentialsView.vue');
@@ -12,6 +13,17 @@ const ProjectSettings = async () => await import('./views/ProjectSettings.vue');
 const ExecutionsView = async () =>
 	await import('@/features/execution/executions/views/ExecutionsView.vue');
 const ProjectVariables = async () => await import('./views/ProjectVariables.vue');
+
+function refreshInsightsSummary() {
+	void import('@n8n/frontend-module-insights')
+		.then(({ useInsightsStore }) => {
+			const insightsStore = useInsightsStore();
+			if (insightsStore.isSummaryEnabled) {
+				void insightsStore.weeklySummary.execute();
+			}
+		})
+		.catch(() => {});
+}
 
 const checkProjectAvailability = (to?: RouteLocationNormalized): boolean => {
 	if (!to?.params.projectId) {
@@ -24,10 +36,7 @@ const checkProjectAvailability = (to?: RouteLocationNormalized): boolean => {
 const commonChildRoutes: RouteRecordRaw[] = [
 	{
 		path: 'workflows',
-		components: {
-			default: WorkflowsView,
-			sidebar: MainSidebar,
-		},
+		component: WorkflowsView,
 		meta: {
 			middleware: ['authenticated', 'custom'],
 			middlewareOptions: {
@@ -38,10 +47,7 @@ const commonChildRoutes: RouteRecordRaw[] = [
 	{
 		path: 'credentials/:credentialId?',
 		props: true,
-		components: {
-			default: CredentialsView,
-			sidebar: MainSidebar,
-		},
+		component: CredentialsView,
 		meta: {
 			middleware: ['authenticated', 'custom'],
 			middlewareOptions: {
@@ -51,10 +57,7 @@ const commonChildRoutes: RouteRecordRaw[] = [
 	},
 	{
 		path: 'executions',
-		components: {
-			default: ExecutionsView,
-			sidebar: MainSidebar,
-		},
+		component: ExecutionsView,
 		meta: {
 			middleware: ['authenticated', 'custom'],
 			middlewareOptions: {
@@ -64,10 +67,7 @@ const commonChildRoutes: RouteRecordRaw[] = [
 	},
 	{
 		path: 'folders/:folderId?/workflows',
-		components: {
-			default: WorkflowsView,
-			sidebar: MainSidebar,
-		},
+		component: WorkflowsView,
 		meta: {
 			middleware: ['authenticated', 'custom'],
 			middlewareOptions: {
@@ -77,10 +77,7 @@ const commonChildRoutes: RouteRecordRaw[] = [
 	},
 	{
 		path: 'variables',
-		components: {
-			default: ProjectVariables,
-			sidebar: MainSidebar,
-		},
+		component: ProjectVariables,
 		meta: {
 			middleware: ['authenticated', 'custom'],
 			middlewareOptions: {
@@ -152,10 +149,7 @@ export const projectsRoutes: RouteRecordRaw[] = [
 						{
 							path: 'settings',
 							name: VIEWS.PROJECT_SETTINGS,
-							components: {
-								default: ProjectSettings,
-								sidebar: MainSidebar,
-							},
+							component: ProjectSettings,
 							meta: {
 								middleware: ['authenticated', 'custom'],
 								middlewareOptions: {
@@ -163,7 +157,14 @@ export const projectsRoutes: RouteRecordRaw[] = [
 										const project = useProjectsStore().myProjects.find(
 											(p) => p.id === options?.to.params.projectId,
 										);
-										return !!getResourcePermissions(project?.scopes).project.update;
+										const permissions = getResourcePermissions(project?.scopes);
+										// Mirrors ProjectHeader's showSettings: any one section's
+										// scope is enough to enter the settings page.
+										return (
+											!!permissions.project.update ||
+											!!permissions.project.manageMembers ||
+											!!permissions.externalSecretsProvider.read
+										);
 									},
 								},
 							},
@@ -180,16 +181,23 @@ export const projectsRoutes: RouteRecordRaw[] = [
 		},
 		redirect: '/home/workflows',
 		beforeEnter: (_to, _from, next) => {
-			const insightsStore = useInsightsStore();
-			if (insightsStore.isSummaryEnabled) {
-				// refresh the weekly summary when entering the home route
-				void insightsStore.weeklySummary.execute();
+			const settingsStore = useSettingsStore();
+			if (settingsStore.isChatFeatureEnabled && hasRole(['global:chatUser'])) {
+				// Prevent Chat users from accessing the home view
+				return next({ name: CHAT_VIEW });
 			}
+
+			// Refresh the weekly summary when entering the home route. The import is lazy and
+			// unawaited: this module is in the boot graph through the router, and a chunk that
+			// fails to load must not hold up navigation — the summary only stays stale.
+			refreshInsightsSummary();
+
 			next();
 		},
 		children: commonChildRoutes.map((route, idx) => ({
 			...route,
 			name: commonChildRouteExtensions.home[idx].name,
+			middleware: ['authenticated'],
 		})),
 	},
 	{
@@ -203,10 +211,7 @@ export const projectsRoutes: RouteRecordRaw[] = [
 			{
 				path: 'workflows',
 				name: VIEWS.SHARED_WORKFLOWS,
-				components: {
-					default: WorkflowsView,
-					sidebar: MainSidebar,
-				},
+				component: WorkflowsView,
 				meta: {
 					middleware: ['authenticated', 'custom'],
 					middlewareOptions: {
@@ -218,10 +223,7 @@ export const projectsRoutes: RouteRecordRaw[] = [
 				path: 'credentials/:credentialId?',
 				props: true,
 				name: VIEWS.SHARED_CREDENTIALS,
-				components: {
-					default: CredentialsView,
-					sidebar: MainSidebar,
-				},
+				component: CredentialsView,
 				meta: {
 					middleware: ['authenticated', 'custom'],
 					middlewareOptions: {

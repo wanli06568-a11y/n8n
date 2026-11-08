@@ -1,4 +1,5 @@
-import { Service } from '@n8n/di';
+import { GlobalConfig } from '@n8n/config';
+import { BreakingChangeRule } from '@n8n/decorators';
 
 import type {
 	BreakingChangeRuleMetadata,
@@ -7,8 +8,10 @@ import type {
 } from '../../types';
 import { BreakingChangeCategory } from '../../types';
 
-@Service()
+@BreakingChangeRule({ version: 'v2' })
 export class TaskRunnerDockerImageRule implements IBreakingChangeInstanceRule {
+	constructor(private readonly globalConfig: GlobalConfig) {}
+
 	id: string = 'task-runner-docker-image-v2';
 
 	getMetadata(): BreakingChangeRuleMetadata {
@@ -18,13 +21,22 @@ export class TaskRunnerDockerImageRule implements IBreakingChangeInstanceRule {
 			description:
 				'Task runners are no longer included in the n8nio/n8n docker image and must use the separate n8nio/runners image',
 			category: BreakingChangeCategory.infrastructure,
-			severity: 'medium',
+			impact: 'executionsFail',
 			documentationUrl:
 				'https://docs.n8n.io/2-0-breaking-changes/#remove-task-runner-from-n8nion8n-docker-image',
 		};
 	}
 
 	async detect(): Promise<InstanceDetectionReport> {
+		// Not relevant for cloud deployments - cloud manages Docker images
+		if (this.globalConfig.deployment.type === 'cloud') {
+			return {
+				isAffected: false,
+				instanceIssues: [],
+				recommendations: [],
+			};
+		}
+
 		const result: InstanceDetectionReport = {
 			isAffected: true,
 			instanceIssues: [

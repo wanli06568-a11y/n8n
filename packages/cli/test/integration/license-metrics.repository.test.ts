@@ -1,5 +1,11 @@
-import { createManyWorkflows, testDb } from '@n8n/backend-test-utils';
-import { StatisticsNames, LicenseMetricsRepository, WorkflowStatisticsRepository } from '@n8n/db';
+import { createManyActiveWorkflows, createManyWorkflows, testDb } from '@n8n/backend-test-utils';
+import {
+	GLOBAL_MEMBER_ROLE,
+	StatisticsNames,
+	LicenseMetricsRepository,
+	ServiceAccountRepository,
+	WorkflowStatisticsRepository,
+} from '@n8n/db';
 import { Container } from '@n8n/di';
 
 import { createManyCredentials } from './shared/db/credentials';
@@ -33,7 +39,7 @@ describe('LicenseMetricsRepository', () => {
 
 	describe('getLicenseRenewalMetrics', () => {
 		test('should return license renewal metrics', async () => {
-			const [firstWorkflow, secondWorkflow] = await createManyWorkflows(2, { active: false });
+			const [firstWorkflow, secondWorkflow] = await createManyWorkflows(2);
 
 			await Promise.all([
 				createOwner(),
@@ -42,7 +48,7 @@ describe('LicenseMetricsRepository', () => {
 				createMember(),
 				createUser({ disabled: true }),
 				createManyCredentials(2),
-				createManyWorkflows(3, { active: true }),
+				createManyActiveWorkflows(3),
 			]);
 
 			await Promise.all([
@@ -62,10 +68,9 @@ describe('LicenseMetricsRepository', () => {
 					StatisticsNames.manualError,
 					secondWorkflow.id,
 				),
-				workflowStatisticsRepository.upsertWorkflowStatistics(
+				workflowStatisticsRepository.insertWorkflowStatistics(
 					StatisticsNames.productionSuccess,
 					secondWorkflow.id,
-					true,
 				),
 			]);
 
@@ -85,7 +90,8 @@ describe('LicenseMetricsRepository', () => {
 		});
 
 		test('should handle zero execution statistics correctly', async () => {
-			await Promise.all([createOwner(), createManyWorkflows(3, { active: true })]);
+			const owner = await createOwner();
+			await createManyActiveWorkflows(3, {}, owner);
 
 			const metrics = await licenseMetricsRepository.getLicenseRenewalMetrics();
 
@@ -100,6 +106,19 @@ describe('LicenseMetricsRepository', () => {
 				manualExecutions: 0, // not NaN
 				evaluations: 0,
 			});
+		});
+
+		test('should not count service accounts as users', async () => {
+			await createMember();
+			await Container.get(ServiceAccountRepository).create({
+				name: 'Deploy bot',
+				role: GLOBAL_MEMBER_ROLE,
+			});
+
+			const metrics = await licenseMetricsRepository.getLicenseRenewalMetrics();
+
+			expect(metrics.enabledUsers).toBe(1);
+			expect(metrics.totalUsers).toBe(1);
 		});
 	});
 });

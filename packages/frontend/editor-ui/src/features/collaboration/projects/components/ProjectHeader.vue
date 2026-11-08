@@ -3,29 +3,41 @@ import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useElementSize, useResizeObserver } from '@vueuse/core';
 import type { TabOptions, UserAction } from '@n8n/design-system';
+import type { SlotProjectHeaderMainButton, SlotProjectHeaderProps } from '@n8n/frontend-module-sdk';
 import { useI18n } from '@n8n/i18n';
 import { ProjectTypes } from '../projects.types';
 import { useProjectsStore } from '../projects.store';
+import { canConfigureSelfHealing, selfHealingLocation } from '../projects.utils';
 import ProjectTabs from './ProjectTabs.vue';
 import ProjectIcon from './ProjectIcon.vue';
 import { getResourcePermissions } from '@n8n/permissions';
 import { EnterpriseEditionFeature, VIEWS } from '@/app/constants';
 import { useSourceControlStore } from '@/features/integrations/sourceControl.ee/sourceControl.store';
 import ProjectCreateResource from './ProjectCreateResource.vue';
-import { useSettingsStore } from '@/app/stores/settings.store';
+import { useSettingsStore } from '@n8n/stores/settings.store';
 import { useProjectPages } from '@/features/collaboration/projects/composables/useProjectPages';
 import { truncateTextToFitWidth } from '@/app/utils/formatters/textFormatter';
-import { type IconName } from '@n8n/design-system/components/N8nIcon/icons';
+import { type IconName } from '@n8n/design-system';
 import type { IUser } from 'n8n-workflow';
-import { type IconOrEmoji, isIconOrEmoji } from '@n8n/design-system/components/N8nIconPicker/types';
+import { type IconOrEmoji, isIconOrEmoji } from '@n8n/design-system';
 import { useUIStore } from '@/app/stores/ui.store';
 import { PROJECT_DATA_TABLES } from '@/features/core/dataTable/constants';
+import {
+	PERSONAL_SELF_HEALING_VIEW,
+	PERSONAL_SELF_HEALING_CONFIGURATION_VIEW,
+} from '@n8n/frontend-constants/self-healing';
+import { useAgentPermissions } from '@/features/agents/composables/useAgentPermissions';
 import ReadyToRunButton from '@/features/workflows/readyToRun/components/ReadyToRunButton.vue';
+import PromotionPreviewBadges from '@/features/integrations/promotions.ee/components/PromotionPreviewBadges.vue';
 
-import { N8nButton, N8nHeading, N8nText, N8nTooltip } from '@n8n/design-system';
+import { N8nButton, N8nHeading, N8nIconButton, N8nText, N8nTooltip } from '@n8n/design-system';
 import { VARIABLE_MODAL_KEY } from '@/features/settings/environments.ee/environments.constants';
-import { useTelemetry } from '@/app/composables/useTelemetry';
-import { useUsersStore } from '@/features/settings/users/users.store';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
+import { useCreateAgent } from '@/features/agents/composables/useCreateAgent';
+import { useUsersStore } from '@n8n/stores/users.store';
+import { useFavoritesStore } from '@/app/stores/favorites.store';
+import { useCreateApp } from '@n8n/frontend-module-apps';
+
 const route = useRoute();
 const router = useRouter();
 const i18n = useI18n();
@@ -34,14 +46,27 @@ const sourceControlStore = useSourceControlStore();
 const settingsStore = useSettingsStore();
 const uiStore = useUIStore();
 const telemetry = useTelemetry();
+const { createAgent } = useCreateAgent();
+const { createApp } = useCreateApp();
 const usersStore = useUsersStore();
+const favoritesStore = useFavoritesStore();
+
+const currentProjectId = computed(() => projectsStore.currentProject?.id);
+
+const isTeamProject = computed(() => projectsStore.currentProject?.type === ProjectTypes.Team);
+
+const isProjectFavorited = computed(() =>
+	currentProjectId.value ? favoritesStore.isFavorite(currentProjectId.value, 'project') : false,
+);
+
+async function onToggleProjectFavorite() {
+	if (!currentProjectId.value) return;
+	await favoritesStore.toggleFavorite(currentProjectId.value, 'project');
+}
 
 const projectPages = useProjectPages();
 
-const props = defineProps<{
-	hasActiveCallouts?: boolean;
-	mainButton?: ActionTypes;
-}>();
+const props = defineProps<SlotProjectHeaderProps>();
 
 const emit = defineEmits<{
 	createFolder: [];
@@ -59,12 +84,22 @@ const headerIcon = computed((): IconOrEmoji => {
 	}
 });
 
+const homeProject = computed(() => projectsStore.currentProject ?? projectsStore.personalProject);
+
+const { canCreate: canCreateAgent } = useAgentPermissions(() => homeProject.value?.id);
+
+const isPersonalProject = computed(() => {
+	return homeProject.value?.type === ProjectTypes.Personal;
+});
+
 const projectName = computed(() => {
 	if (!projectsStore.currentProject) {
 		if (projectPages.isSharedSubPage) {
 			return i18n.baseText('projects.header.shared.title');
 		} else if (projectPages.isOverviewSubPage) {
 			return i18n.baseText('projects.menu.overview');
+		} else if (isPersonalProject.value) {
+			return i18n.baseText('projects.menu.personal');
 		}
 		return null;
 	} else if (projectsStore.currentProject.type === ProjectTypes.Personal) {
@@ -84,18 +119,20 @@ const globalVariablesPermissions = computed(
 	() => getResourcePermissions(usersStore.currentUser?.globalScopes).variable,
 );
 
+const externalSecretsProviderPermissions = computed(
+	() => getResourcePermissions(projectsStore.currentProject?.scopes).externalSecretsProvider,
+);
+
 const showSettings = computed(
 	() =>
 		!!route?.params?.projectId &&
-		!!projectPermissions.value.update &&
+		// Each section of the settings page is entered by its own scope, so any one
+		// of them is enough to reach the page.
+		(!!projectPermissions.value.update ||
+			!!projectPermissions.value.manageMembers ||
+			!!externalSecretsProviderPermissions.value.read) &&
 		projectsStore.currentProject?.type === ProjectTypes.Team,
 );
-
-const homeProject = computed(() => projectsStore.currentProject ?? projectsStore.personalProject);
-
-const isPersonalProject = computed(() => {
-	return homeProject.value?.type === ProjectTypes.Personal;
-});
 
 const showFolders = computed(() => {
 	return (
@@ -104,21 +141,44 @@ const showFolders = computed(() => {
 	);
 });
 
-const customProjectTabs = computed((): Array<TabOptions<string>> => {
-	// Determine the type of tab based on the current project page
-	let tabType: 'shared' | 'overview' | 'project';
+const pageType = computed(() => {
 	if (projectPages.isSharedSubPage) {
-		tabType = 'shared';
+		return 'shared';
 	} else if (projectPages.isOverviewSubPage) {
-		tabType = 'overview';
+		return 'overview';
 	} else {
-		tabType = 'project';
+		return 'project';
 	}
+});
+
+const personalSelfHealingTab = computed((): TabOptions<string> | null => {
+	const project = projectsStore.currentProject;
+	if (
+		pageType.value !== 'project' ||
+		!project ||
+		project.id !== route?.params?.projectId ||
+		selfHealingLocation(project) !== 'personalTab' ||
+		!canConfigureSelfHealing(project)
+	) {
+		return null;
+	}
+	return {
+		label: i18n.baseText('selfHealing.config.heading'),
+		value: PERSONAL_SELF_HEALING_VIEW,
+		to: { name: PERSONAL_SELF_HEALING_VIEW, params: { projectId: project.id } },
+	};
+});
+
+const customProjectTabs = computed((): Array<TabOptions<string>> => {
 	// Only pick up tabs from active modules
-	const activeModules = Object.keys(uiStore.moduleTabs[tabType]).filter(
-		settingsStore.isModuleActive,
+	const moduleTabs = uiStore.moduleTabs[pageType.value];
+	const activeModules = Object.keys(moduleTabs).filter(
+		(module) =>
+			settingsStore.isModuleActive(module) &&
+			(module !== 'agents' || settingsStore.isAgentsEnabled),
 	);
-	return activeModules.flatMap((module) => uiStore.moduleTabs[tabType][module]);
+	const tabs = activeModules.flatMap((module) => moduleTabs[module]);
+	return personalSelfHealingTab.value ? [...tabs, personalSelfHealingTab.value] : tabs;
 });
 
 const ACTION_TYPES = {
@@ -127,7 +187,10 @@ const ACTION_TYPES = {
 	FOLDER: 'folder',
 	DATA_TABLE: 'dataTable',
 	VARIABLE: 'variable',
-} as const;
+	AGENT: 'agent',
+	APP: 'app',
+	SELF_HEALING: 'selfHealing',
+} as const satisfies Record<string, SlotProjectHeaderMainButton | 'folder'>;
 type ActionTypes = (typeof ACTION_TYPES)[keyof typeof ACTION_TYPES];
 
 const createWorkflowButton = computed(() => ({
@@ -167,10 +230,47 @@ const createVariableButton = computed(() => ({
 	size: 'mini' as const,
 	disabled:
 		sourceControlStore.preferences.branchReadOnly ||
+		!settingsStore.isEnterpriseFeatureEnabled[EnterpriseEditionFeature.Variables] ||
 		(!projectVariablePermissions.value.create && !globalVariablesPermissions.value.create),
 }));
 
-const selectedMainButtonType = computed(() => props.mainButton ?? ACTION_TYPES.WORKFLOW);
+const createAgentButton = computed(() => ({
+	value: ACTION_TYPES.AGENT,
+	label: i18n.baseText('projects.header.create.agent'),
+	size: 'mini' as const,
+	disabled: !canCreateAgent.value,
+}));
+
+const canCreateApp = computed(
+	() =>
+		settingsStore.isAppsEnabled &&
+		!sourceControlStore.preferences.branchReadOnly &&
+		Boolean(getResourcePermissions(homeProject.value?.scopes).app?.create),
+);
+const createAppButton = computed(() => ({
+	value: ACTION_TYPES.APP,
+	label: i18n.baseText('projects.header.create.app'),
+	size: 'mini' as const,
+	disabled: !canCreateApp.value,
+}));
+
+const createSelfHealingButton = computed(() => ({
+	value: ACTION_TYPES.SELF_HEALING,
+	label: i18n.baseText('selfHealing.config.create'),
+	icon: sourceControlStore.preferences.branchReadOnly ? ('lock' as IconName) : undefined,
+	size: 'mini' as const,
+	disabled: sourceControlStore.preferences.branchReadOnly || !personalSelfHealingTab.value,
+}));
+
+const selectedMainButtonType = computed(() => {
+	if (props.mainButton === ACTION_TYPES.AGENT && !settingsStore.isAgentsEnabled) {
+		return ACTION_TYPES.WORKFLOW;
+	}
+	if (props.mainButton === ACTION_TYPES.APP && !settingsStore.isAppsEnabled) {
+		return ACTION_TYPES.WORKFLOW;
+	}
+	return props.mainButton ?? ACTION_TYPES.WORKFLOW;
+});
 
 const mainButtonConfig = computed(() => {
 	switch (selectedMainButtonType.value) {
@@ -180,6 +280,12 @@ const mainButtonConfig = computed(() => {
 			return createDataTableButton.value;
 		case ACTION_TYPES.VARIABLE:
 			return createVariableButton.value;
+		case ACTION_TYPES.SELF_HEALING:
+			return createSelfHealingButton.value;
+		case ACTION_TYPES.AGENT:
+			return createAgentButton.value;
+		case ACTION_TYPES.APP:
+			return createAppButton.value;
 		case ACTION_TYPES.WORKFLOW:
 		default:
 			return createWorkflowButton.value;
@@ -248,6 +354,22 @@ const menu = computed(() => {
 		});
 	}
 
+	if (settingsStore.isAgentsEnabled && selectedMainButtonType.value !== ACTION_TYPES.AGENT) {
+		items.push({
+			value: ACTION_TYPES.AGENT,
+			label: i18n.baseText('projects.header.create.agent'),
+			disabled: !canCreateAgent.value,
+		});
+	}
+
+	if (settingsStore.isAppsEnabled && selectedMainButtonType.value !== ACTION_TYPES.APP) {
+		items.push({
+			value: ACTION_TYPES.APP,
+			label: i18n.baseText('projects.header.create.app'),
+			disabled: !canCreateApp.value,
+		});
+	}
+
 	return items;
 });
 
@@ -288,7 +410,9 @@ function getUIContext(routeName: string) {
 	}
 }
 
-const actions: Record<ActionTypes, (projectId: string) => void> = {
+type CreateSource = 'button' | 'dropdown';
+
+const actions: Record<ActionTypes, (projectId: string, source: CreateSource) => void> = {
 	[ACTION_TYPES.WORKFLOW]: (projectId: string) => {
 		void router.push({
 			name: VIEWS.NEW_WORKFLOW,
@@ -324,17 +448,19 @@ const actions: Record<ActionTypes, (projectId: string) => void> = {
 		uiStore.openModalWithData({ name: VARIABLE_MODAL_KEY, data: { mode: 'new' } });
 		telemetry.track('User clicked header add variable button');
 	},
+	[ACTION_TYPES.SELF_HEALING]: (projectId) => {
+		void router.push({
+			name: PERSONAL_SELF_HEALING_CONFIGURATION_VIEW,
+			params: { projectId, configurationId: 'new' },
+		});
+	},
+	[ACTION_TYPES.AGENT]: (projectId, source) => {
+		createAgent(source, projectId);
+	},
+	[ACTION_TYPES.APP]: (projectId) => {
+		createApp(projectId);
+	},
 } as const;
-
-const pageType = computed(() => {
-	if (projectPages.isSharedSubPage) {
-		return 'shared';
-	} else if (projectPages.isOverviewSubPage) {
-		return 'overview';
-	} else {
-		return 'project';
-	}
-});
 
 const sectionDescription = computed(() => {
 	if (projectPages.isSharedSubPage) {
@@ -364,11 +490,11 @@ const projectDescription = computed(() => {
 	return null;
 });
 
-const projectHeaderRef = ref<HTMLElement | null>(null);
-const { width: projectHeaderWidth } = useElementSize(projectHeaderRef);
+const favoriteIcon = computed(() => (isProjectFavorited.value ? 'star-filled' : 'star'));
 
-const headerActionsRef = ref<HTMLElement | null>(null);
-const { width: headerActionsWidth } = useElementSize(headerActionsRef);
+const projectHeaderRef = ref<HTMLElement | null>(null);
+const projectInfoRef = ref<HTMLElement | null>(null);
+const { width: projectInfoWidth } = useElementSize(projectInfoRef);
 
 const projectSubtitleFontSizeInPxs = ref<number | null>(null);
 
@@ -391,19 +517,18 @@ const projectDescriptionTruncated = computed(() => {
 		return '';
 	}
 
-	const availableTextWidth = projectHeaderWidth.value - headerActionsWidth.value;
 	// Fallback to N8nText component default font-size, small
 	const fontSizeInPixels = projectSubtitleFontSizeInPxs.value ?? 14;
-	return truncateTextToFitWidth(projectDescription.value, availableTextWidth, fontSizeInPixels);
+	return truncateTextToFitWidth(projectDescription.value, projectInfoWidth.value, fontSizeInPixels);
 });
 
-const onSelect = (action: string) => {
+const onSelect = (action: string, source: CreateSource) => {
 	const executableAction = actions[action as ActionTypes];
 	if (!homeProject.value) {
 		return;
 	}
 
-	executableAction(homeProject.value.id);
+	executableAction(homeProject.value.id, source);
 };
 </script>
 
@@ -412,16 +537,40 @@ const onSelect = (action: string) => {
 		<div ref="projectHeaderRef" :class="$style.projectHeader">
 			<div :class="$style.projectDetails">
 				<ProjectIcon v-if="showProjectIcon" :icon="headerIcon" :border-less="true" size="medium" />
-				<div :class="$style.headerActions">
-					<N8nHeading v-if="projectName" bold tag="h2" size="xlarge" data-test-id="project-name">{{
-						projectName
-					}}</N8nHeading>
+				<div ref="projectInfoRef" :class="$style.projectInfo">
+					<div :class="$style.titleRow">
+						<N8nHeading
+							v-if="projectName"
+							:class="$style.projectName"
+							:title="projectName"
+							bold
+							tag="h2"
+							size="xlarge"
+							data-test-id="project-name"
+							>{{ projectName }}</N8nHeading
+						>
+						<N8nIconButton
+							v-if="isTeamProject"
+							:class="[$style.favoriteBtn, isProjectFavorited && $style.favoriteBtnActive]"
+							:icon="favoriteIcon"
+							:aria-label="i18n.baseText(isProjectFavorited ? 'favorites.remove' : 'favorites.add')"
+							variant="ghost"
+							size="medium"
+							data-test-id="project-favorite-btn"
+							@click.stop="onToggleProjectFavorite"
+						/>
+						<PromotionPreviewBadges :class="$style.promotionBadges" />
+					</div>
 					<N8nText v-if="sectionDescription" color="text-light" data-test-id="project-subtitle">
 						{{ sectionDescription }}
 					</N8nText>
 					<template v-else-if="projectDescription">
 						<div :class="$style.projectDescriptionWrapper">
-							<N8nText color="text-light" data-test-id="project-subtitle">
+							<N8nText
+								:class="$style.descriptionText"
+								color="text-light"
+								data-test-id="project-subtitle"
+							>
 								{{ projectDescriptionTruncated || projectDescription }}
 							</N8nText>
 							<div v-if="projectDescriptionTruncated" :class="$style.tooltip">
@@ -431,11 +580,7 @@ const onSelect = (action: string) => {
 					</template>
 				</div>
 			</div>
-			<div
-				v-if="route.name !== VIEWS.PROJECT_SETTINGS"
-				ref="headerActionsRef"
-				:class="[$style.headerActions]"
-			>
+			<div v-if="route.name !== VIEWS.PROJECT_SETTINGS" :class="[$style.headerActions]">
 				<N8nTooltip
 					:disabled="!sourceControlStore.preferences.branchReadOnly"
 					:content="i18n.baseText('readOnlyEnv.cantAdd.any')"
@@ -445,13 +590,16 @@ const onSelect = (action: string) => {
 						<ProjectCreateResource
 							data-test-id="add-resource-buttons"
 							:actions="menu"
+							variant="brand"
 							:disabled="sourceControlStore.preferences.branchReadOnly"
-							@action="onSelect"
+							@action="(action: string) => onSelect(action, 'dropdown')"
 						>
 							<N8nButton
 								:data-test-id="`add-resource-${selectedMainButtonType}`"
 								v-bind="mainButtonConfig"
-								@click="onSelect(selectedMainButtonType)"
+								size="medium"
+								variant="brand"
+								@click="onSelect(selectedMainButtonType, 'button')"
 							/>
 						</ProjectCreateResource>
 					</div>
@@ -471,30 +619,59 @@ const onSelect = (action: string) => {
 </template>
 
 <style lang="scss" module>
+@use '@n8n/design-system/css/mixins/breakpoints';
+
 .projectHeader {
 	display: flex;
 	align-items: flex-start;
 	justify-content: space-between;
-	padding-bottom: var(--spacing--lg);
+	gap: var(--spacing--sm);
 	min-height: var(--spacing--3xl);
 }
 
 .projectDetails {
 	display: flex;
-	align-items: center;
+	align-items: flex-start;
+	flex: 1;
+	min-width: 0;
+}
+
+.projectInfo {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-width: 0;
+	gap: var(--spacing--4xs);
+}
+
+.projectName {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.promotionBadges {
+	flex-shrink: 0;
 }
 
 .actions {
-	padding: var(--spacing--2xs) 0 var(--spacing--xs);
+	padding: var(--spacing--xs) 0 var(--spacing--xs);
 }
 
 .projectDescriptionWrapper {
 	position: relative;
-	display: inline-block;
 
 	&:hover .tooltip {
 		display: block;
 	}
+}
+
+.descriptionText {
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 .tooltip {
@@ -510,11 +687,37 @@ const onSelect = (action: string) => {
 	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
 }
 
-@include mixins.breakpoint('xs-only') {
+.favoriteBtn {
+	flex-shrink: 0;
+	cursor: pointer;
+	color: var(--color--text--tint-2);
+	opacity: 0.8;
+
+	&.favoriteBtnActive {
+		color: var(--color--yellow-500);
+	}
+}
+
+.titleRow {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing--2xs);
+	min-height: var(--height--md);
+}
+
+.projectDetails:hover .favoriteBtn {
+	opacity: 1;
+}
+
+@include breakpoints.breakpoint('xs-only') {
 	.projectHeader {
 		flex-direction: column;
 		align-items: flex-start;
 		gap: var(--spacing--xs);
+	}
+
+	.projectDetails {
+		width: 100%;
 	}
 
 	.headerActions {

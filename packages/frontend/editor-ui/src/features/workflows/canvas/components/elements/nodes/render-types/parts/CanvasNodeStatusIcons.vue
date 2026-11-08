@@ -1,15 +1,22 @@
 <script setup lang="ts">
-import { computed, useCssModule } from 'vue';
+import { computed, inject, useCssModule } from 'vue';
 import TitledList from '@/app/components/TitledList.vue';
 import { useNodeHelpers } from '@/app/composables/useNodeHelpers';
 import { useCanvasNode } from '../../../../../composables/useCanvasNode';
+import { injectCanvasRenderData } from '@/features/workflows/canvas/canvas.utils';
 import { useI18n } from '@n8n/i18n';
 import { CanvasNodeDirtiness, CanvasNodeRenderType } from '../../../../../canvas.types';
-import { useCanvas } from '@/features/workflows/canvas/composables/useCanvas';
 import { useRoute } from 'vue-router';
-import { VIEWS } from '@/app/constants';
+import { EditorEnabledFeaturesKey, VIEWS } from '@/app/constants';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
 
 import { N8nIcon, N8nTooltip } from '@n8n/design-system';
+import {
+	describeSubWorkflowRestriction,
+	useSubWorkflowRestriction,
+} from '@n8n/frontend-module-type-availability-policies';
+import { usePolicyViolationLabels } from '@/app/composables/usePolicyViolationLabels';
+import CanvasNodeStatusMark from './CanvasNodeStatusMark.vue';
 const {
 	size = 'large',
 	spinnerScrim = false,
@@ -25,23 +32,82 @@ const i18n = useI18n();
 const $style = useCssModule();
 
 const {
-	hasPinnedData,
-	executionErrors,
+	id,
+	name,
 	validationErrors,
-	hasExecutionErrors,
 	hasValidationErrors,
 	executionStatus,
-	executionWaiting,
-	executionWaitingForNext,
-	executionRunning,
 	hasRunData,
 	runDataIterations,
 	isDisabled,
+	isReadOnly,
 	render,
 	isNotInstalledCommunityNode,
+	isRestricted,
+	restrictionScope,
+	isDeprecated,
+	deprecatedReplacementName,
 } = useCanvasNode();
+const renderData = injectCanvasRenderData();
+
+const deprecatedTooltip = computed(() =>
+	deprecatedReplacementName.value
+		? i18n.baseText('node.deprecatedWithReplacement', {
+				interpolate: { nodeTypeName: deprecatedReplacementName.value },
+			})
+		: i18n.baseText('node.deprecated'),
+);
+
+const editorFeatures = inject(EditorEnabledFeaturesKey, undefined);
+const workflowDocumentStore = injectWorkflowDocumentStore();
+const needsCredentialSetup = computed(() => {
+	if (!editorFeatures?.value.credentialSetupWarnings) return false;
+	const node = workflowDocumentStore.value.getNodeById(id.value);
+	const issues = node?.issues;
+	const credentialTypes = Object.keys(issues?.credentials ?? {});
+	if (!node || !credentialTypes.length) return false;
+	if (
+		Object.entries(issues ?? {}).some(
+			([kind, issue]) =>
+				kind !== 'credentials' &&
+				(typeof issue === 'boolean' ? issue : Object.keys(issue ?? {}).length > 0),
+		)
+	)
+		return false;
+	return credentialTypes.every((type) => {
+		const credential = node.credentials?.[type];
+		return !credential?.id && !credential?.__aiGatewayManaged;
+	});
+});
+const { labelOf } = usePolicyViolationLabels();
+const { restriction: subWorkflowRestriction } = useSubWorkflowRestriction({
+	parentWorkflowId: () => workflowDocumentStore.value.workflowId,
+	node: () => workflowDocumentStore.value.getNodeById(id.value),
+	// The check is gated like the sub-workflow picker, so a viewer would only get a 403.
+	enabled: () =>
+		!isReadOnly.value && workflowDocumentStore.value.scopes.includes('workflow:update'),
+});
+const subWorkflowRestrictionLines = computed(() =>
+	subWorkflowRestriction.value
+		? describeSubWorkflowRestriction(subWorkflowRestriction.value, labelOf)
+		: [],
+);
+const executionErrors = computed(
+	() => renderData.value.executionIssuesByNodeId.get(id.value)?.value ?? [],
+);
+const hasExecutionErrors = computed(() => executionErrors.value.length > 0);
+const hasPinnedData = computed(
+	() =>
+		!renderData.value.isExecutionDataDisplayed &&
+		!!renderData.value.pinnedDataByNodeName[name.value],
+);
+const hasExecutionPinData = computed(
+	() =>
+		renderData.value.isExecutionDataDisplayed &&
+		!!renderData.value.executionPinDataByNodeId.get(id.value)?.value,
+);
+const hasVisiblePinData = computed(() => hasPinnedData.value || hasExecutionPinData.value);
 const route = useRoute();
-const { isExecuting } = useCanvas();
 
 const hideNodeIssues = computed(() => false); // @TODO Implement this
 const isDemoRoute = computed(() => route.name === VIEWS.DEMO);
@@ -49,30 +115,45 @@ const dirtiness = computed(() =>
 	render.value.type === CanvasNodeRenderType.Default ? render.value.options.dirtiness : undefined,
 );
 
-const isNodeExecuting = computed(() => {
-	if (!isExecuting.value) return false;
-
-	return (
-		executionRunning.value || executionWaitingForNext.value || executionStatus.value === 'running' // eslint-disable-line @typescript-eslint/prefer-nullish-coalescing
-	);
-});
 const commonClasses = computed(() => [
 	$style.status,
 	spinnerScrim ? $style.spinnerScrim : '',
 	spinnerLayout === 'absolute' ? $style.absoluteSpinner : '',
 ]);
+
+const restrictionTitle = computed(() =>
+	i18n.baseText(
+		restrictionScope.value === 'project'
+			? 'node.restricted.project.title'
+			: 'node.restricted.instance.title',
+	),
+);
+
+const groupedExecutionErrors = computed(() => {
+	const errorCounts = executionErrors.value.reduce(
+		(acc, error) => {
+			acc[error] = (acc[error] || 0) + 1;
+			return acc;
+		},
+		{} as Record<string, number>,
+	);
+
+	return Object.entries(errorCounts).map(([error, count]) =>
+		count > 1 ? `${error} (x${count})` : error,
+	);
+});
 </script>
 
 <template>
-	<div v-if="executionWaiting || executionStatus === 'waiting'">
-		<div :class="[...commonClasses, $style.waiting]">
-			<N8nTooltip placement="bottom">
-				<template #content>
-					<div v-text="executionWaiting"></div>
-				</template>
-				<N8nIcon icon="clock" :size="size" />
-			</N8nTooltip>
-		</div>
+	<div
+		v-if="isRestricted"
+		:class="[...commonClasses, $style.issues]"
+		data-test-id="node-restricted"
+	>
+		<N8nTooltip :show-after="500" placement="bottom">
+			<template #content>{{ restrictionTitle }}</template>
+			<N8nIcon icon="lock" :size="size" />
+		</N8nTooltip>
 	</div>
 	<div
 		v-else-if="isNotInstalledCommunityNode && !isDemoRoute"
@@ -84,13 +165,6 @@ const commonClasses = computed(() => [
 			<N8nIcon icon="hard-drive-download" :size="size" />
 		</N8nTooltip>
 	</div>
-	<div
-		v-else-if="isNodeExecuting"
-		data-test-id="canvas-node-status-running"
-		:class="[...commonClasses, $style.running]"
-	>
-		<N8nIcon icon="refresh-cw" spin />
-	</div>
 	<div v-else-if="isDisabled" :class="[...commonClasses, $style.disabled]">
 		<N8nIcon icon="power" :size="size" />
 	</div>
@@ -101,28 +175,58 @@ const commonClasses = computed(() => [
 	>
 		<N8nTooltip :show-after="500" placement="bottom">
 			<template #content>
-				<TitledList :title="`${i18n.baseText('node.issues')}:`" :items="executionErrors" />
+				<TitledList :title="`${i18n.baseText('node.issues')}:`" :items="groupedExecutionErrors" />
 			</template>
-			<N8nIcon icon="node-execution-error" :size="size" />
+			<CanvasNodeStatusMark status="error" :size="size" />
+		</N8nTooltip>
+	</div>
+	<div
+		v-else-if="isDeprecated"
+		:class="[...commonClasses, $style.deprecated]"
+		data-test-id="canvas-node-status-deprecated"
+	>
+		<N8nTooltip :show-after="500" placement="bottom">
+			<template #content> {{ deprecatedTooltip }} </template>
+			<N8nIcon icon="triangle-alert" :size="size" />
 		</N8nTooltip>
 	</div>
 	<div
 		v-else-if="hasValidationErrors && !hideNodeIssues"
-		:class="[...commonClasses, $style.issues]"
-		data-test-id="node-issues"
+		:class="[...commonClasses, needsCredentialSetup ? $style.warning : $style.issues]"
+		:data-test-id="needsCredentialSetup ? 'node-setup-required' : 'node-issues'"
 	>
 		<N8nTooltip :show-after="500" placement="bottom">
 			<template #content>
-				<TitledList :title="`${i18n.baseText('node.issues')}:`" :items="validationErrors" />
+				<TitledList
+					:title="i18n.baseText(needsCredentialSetup ? 'node.setupRequired' : 'node.issues')"
+					:items="validationErrors"
+				/>
 			</template>
-			<N8nIcon icon="node-validation-error" :size="size" />
+			<N8nIcon :icon="needsCredentialSetup ? 'key-round' : 'node-validation-error'" :size="size" />
+		</N8nTooltip>
+	</div>
+	<div
+		v-else-if="subWorkflowRestriction"
+		:class="[...commonClasses, $style.warning]"
+		data-test-id="node-sub-workflow-restricted"
+	>
+		<N8nTooltip :show-after="500" placement="bottom">
+			<template #content>
+				<TitledList
+					:title="subWorkflowRestrictionLines[0]"
+					:items="subWorkflowRestrictionLines.slice(1)"
+				/>
+			</template>
+			<N8nIcon icon="triangle-alert" :size="size" />
 		</N8nTooltip>
 	</div>
 	<div v-else-if="executionStatus === 'unknown'">
 		<!-- Do nothing, unknown means the node never executed -->
 	</div>
 	<div
-		v-else-if="hasPinnedData && !nodeHelpers.isProductionExecutionPreview.value"
+		v-else-if="
+			hasVisiblePinData && (!nodeHelpers.isProductionExecutionPreview.value || hasExecutionPinData)
+		"
 		data-test-id="canvas-node-status-pinned"
 		:class="[...commonClasses, $style.pinnedData]"
 	>
@@ -140,18 +244,16 @@ const commonClasses = computed(() => [
 				}}
 			</template>
 			<div data-test-id="canvas-node-status-warning" :class="[...commonClasses, $style.warning]">
-				<N8nIcon icon="node-dirty" :size="size" />
-				<span v-if="runDataIterations > 1" :class="$style.count"> {{ runDataIterations }}</span>
+				<CanvasNodeStatusMark status="warning" :iterations="runDataIterations" :size="size" />
 			</div>
 		</N8nTooltip>
 	</div>
 	<div
 		v-else-if="hasRunData && executionStatus === 'success'"
 		data-test-id="canvas-node-status-success"
-		:class="[...commonClasses, $style.runData]"
+		:class="commonClasses"
 	>
-		<N8nIcon icon="node-success" :size="size" />
-		<span v-if="runDataIterations > 1" :class="$style.count"> {{ runDataIterations }}</span>
+		<CanvasNodeStatusMark status="success" :iterations="runDataIterations" :size="size" />
 	</div>
 </template>
 
@@ -160,11 +262,7 @@ const commonClasses = computed(() => [
 	display: flex;
 	align-items: center;
 	gap: var(--spacing--5xs);
-	font-weight: var(--font-weight--bold);
-}
-
-.runData {
-	color: var(--color--success);
+	font-weight: var(--font-weight--medium);
 }
 
 .waiting {
@@ -199,13 +297,13 @@ const commonClasses = computed(() => [
 	}
 }
 
+.deprecated {
+	color: var(--color--danger);
+}
+
 .issues {
 	color: var(--color--danger);
 	cursor: default;
-}
-
-.count {
-	font-size: var(--font-size--sm);
 }
 
 .warning {

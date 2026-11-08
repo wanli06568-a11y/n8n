@@ -6,9 +6,10 @@ import type {
 	IRequestOptions,
 	IHttpRequestMethods,
 } from 'n8n-workflow';
-import { NodeApiError, NodeOperationError, sleep } from 'n8n-workflow';
+import { NodeApiError, NodeOperationError, sanitizeXmlName } from 'n8n-workflow';
 import { parseString } from 'xml2js';
 
+import { sleep } from '@n8n/utils/sleep';
 import {
 	SPLUNK,
 	type SplunkError,
@@ -91,9 +92,17 @@ export function formatSearch(responseData: SplunkSearchResponse) {
 
 export async function parseXml(xml: string) {
 	return await new Promise((resolve, reject) => {
-		parseString(xml, { explicitArray: false }, (error, result) => {
-			error ? reject(error) : resolve(result);
-		});
+		parseString(
+			xml,
+			{
+				explicitArray: false,
+				tagNameProcessors: [sanitizeXmlName],
+				attrNameProcessors: [sanitizeXmlName],
+			},
+			(error, result) => {
+				error ? reject(error) : resolve(result);
+			},
+		);
 	});
 }
 
@@ -103,7 +112,11 @@ export function extractErrorDescription(rawError: SplunkError) {
 }
 
 export function toUnixEpoch(timestamp: string) {
-	return Date.parse(timestamp) / 1000;
+	// Splunk reads a bare number as epoch seconds; a four-digit one stays a year.
+	if (/^-?\d+(\.\d+)?$/.test(timestamp) && !/^\d{4}$/.test(timestamp)) return timestamp;
+	const parsed = Date.parse(timestamp);
+	// Relative specifiers such as -15m or now are passed through for Splunk to read.
+	return Number.isNaN(parsed) ? timestamp : parsed / 1000;
 }
 
 export async function splunkApiRequest(
@@ -236,8 +249,10 @@ export function formatResults(responseData: SplunkResultResponse) {
 /**
  * Set count of entries to retrieve.
  */
-export function setCount(this: IExecuteFunctions, qs: IDataObject) {
-	qs.count = this.getNodeParameter('returnAll', 0) ? 0 : this.getNodeParameter('limit', 0);
+export function setCount(this: IExecuteFunctions, qs: IDataObject, itemIndex: number) {
+	qs.count = this.getNodeParameter('returnAll', itemIndex)
+		? 0
+		: this.getNodeParameter('limit', itemIndex);
 }
 
 export function populate(source: IDataObject, destination: IDataObject) {

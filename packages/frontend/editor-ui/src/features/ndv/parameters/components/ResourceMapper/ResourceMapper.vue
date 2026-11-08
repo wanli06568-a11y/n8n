@@ -14,25 +14,33 @@ import type {
 	ResourceMapperValue,
 } from 'n8n-workflow';
 import { deepCopy, NodeHelpers } from 'n8n-workflow';
-import { computed, onMounted, reactive, watch } from 'vue';
+import { computed, inject, onMounted, reactive, watch } from 'vue';
+import {
+	ExpressionLocalResolveContextSymbol,
+	ResourceMapperRefreshEmptySchemaKey,
+	ResourceMapperSchemaAutoRefreshKey,
+} from '@/app/constants';
 import MappingModeSelect from './MappingModeSelect.vue';
 import MatchingColumnsSelect from './MatchingColumnsSelect.vue';
 import MappingFields from './MappingFields.vue';
 import {
 	fieldCannotBeDeleted,
 	isResourceMapperFieldListStale,
+	isResourceMapperSchemaIncomplete,
 	parseResourceMapperFieldName,
 } from '@/app/utils/nodeTypesUtils';
 import { isFullExecutionResponse, isResourceMapperValue } from '@/app/utils/typeGuards';
 import { i18n as locale } from '@n8n/i18n';
-import { useNDVStore } from '@/features/ndv/shared/ndv.store';
-import { useWorkflowsStore } from '@/app/stores/workflows.store';
+import { injectNDVStore } from '@/features/ndv/shared/ndv.store';
+import { injectWorkflowExecutionStateStore } from '@/app/stores/workflowExecutionState.store';
 import { useDocumentVisibility } from '@/app/composables/useDocumentVisibility';
+import get from 'lodash/get';
 import isEqual from 'lodash/isEqual';
 import { useProjectsStore } from '@/features/collaboration/projects/projects.store';
 import ParameterInputFull from '../ParameterInputFull.vue';
 
 import { N8nButton, N8nCallout, N8nIcon, N8nNotice, N8nText } from '@n8n/design-system';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
 type Props = {
 	parameter: INodeProperties;
 	node: INode | null;
@@ -46,9 +54,13 @@ type Props = {
 };
 
 const nodeTypesStore = useNodeTypesStore();
-const ndvStore = useNDVStore();
-const workflowsStore = useWorkflowsStore();
+const ndvStore = injectNDVStore();
+const workflowExecutionStateStore = injectWorkflowExecutionStateStore();
 const projectsStore = useProjectsStore();
+const expressionLocalResolveCtx = inject(ExpressionLocalResolveContextSymbol, undefined);
+const schemaAutoRefreshEnabled = inject(ResourceMapperSchemaAutoRefreshKey, true);
+const refreshEmptySchemaEnabled = inject(ResourceMapperRefreshEmptySchemaKey, false);
+const workflowDocumentStore = injectWorkflowDocumentStore();
 
 const props = withDefaults(defineProps<Props>(), {
 	teleported: true,
@@ -70,9 +82,11 @@ const state = reactive({
 		matchingColumns: [] as string[],
 		schema: [] as ResourceMapperField[],
 		attemptToConvertTypes: false,
-		// This should always be true if `showTypeConversionOptions` is provided
-		// It's used to avoid accepting any value as string without casting it
-		// Which is the legacy behavior without these type options.
+		// The execution engine no longer reads this. It stays in the saved value so an
+		// older instance that still reads it keeps casting instead of falling back to
+		// the legacy uncast passthrough. `onMounted` sets it to `true` when
+		// `showTypeConversionOptions` is set, but the stored node values spread after
+		// that, so a persisted value survives untouched. No control ever writes it.
 		convertFieldsToString: false,
 	} as ResourceMapperValue,
 	parameterValues: {} as INodeParameters,
@@ -83,11 +97,41 @@ const state = reactive({
 	emptyFieldsNotice: '',
 });
 
+function getDefaultFieldValue(field?: ResourceMapperField): string | number | boolean | null {
+	if (!field) {
+		return null;
+	}
+
+	if (field.defaultValue !== undefined) {
+		return field.defaultValue;
+	}
+
+	// We only supply boolean defaults since it's a switch that cannot be null in `Fixed` mode
+	// Other defaults may break backwards compatibility as we'd remove the implicit passthrough
+	// mode you get when the field exists, but is empty in `Fixed` mode.
+	if (field.type === 'boolean') {
+		return false;
+	}
+
+	return null;
+}
+
 // Reload fields to map when dependent parameters change
 watch(
 	() => props.dependentParametersValues,
 	async (currentValue, oldValue) => {
-		if (oldValue !== null && currentValue !== null && oldValue !== currentValue) {
+		const dependencyBecameAvailable =
+			refreshEmptySchemaEnabled &&
+			oldValue === null &&
+			currentValue !== null &&
+			currentValue.length > 0 &&
+			state.paramValue.schema.length === 0;
+
+		if (
+			currentValue !== null &&
+			oldValue !== currentValue &&
+			(oldValue !== null || dependencyBecameAvailable)
+		) {
 			state.paramValue = {
 				...state.paramValue,
 				value: null,
@@ -106,18 +150,27 @@ onDocumentVisible(async () => {
 
 async function checkStaleFields(): Promise<void> {
 	const fetchedFields = await fetchFields();
-	if (fetchedFields) {
-		const isSchemaStale = isResourceMapperFieldListStale(
-			state.paramValue.schema,
-			fetchedFields.fields,
-		);
-		state.hasStaleFields = isSchemaStale;
+	if (!fetchedFields) {
+		return;
 	}
+	const isSchemaStale = isResourceMapperFieldListStale(
+		state.paramValue.schema,
+		fetchedFields.fields,
+	);
+	if (
+		isSchemaStale &&
+		schemaAutoRefreshEnabled &&
+		props.parameter.typeOptions?.resourceMapper?.refreshStaleSchemaOnOpen
+	) {
+		await initFetching(true, fetchedFields);
+		return;
+	}
+	state.hasStaleFields = isSchemaStale;
 }
 
 // Reload fields to map when node is executed
 watch(
-	() => workflowsStore.getWorkflowExecution,
+	() => workflowExecutionStateStore.value.activeExecution,
 	async (data) => {
 		if (
 			data &&
@@ -142,16 +195,24 @@ onMounted(async () => {
 		}
 	}
 	const params = state.parameterValues.parameters as INodeParameters;
-	const parameterName = props.parameter.name;
+	// Read by path, the same address emitValueChanged writes to. The name only works at the top level.
+	// 'parameters.entries.entry[1].attributes' -> params.entries.entry[1].attributes
+	const nodeValues = get(params, props.path.replace(/^parameters\./, '')) as
+		| ResourceMapperValue
+		| undefined;
 
-	if (!(parameterName in params)) {
+	if (!nodeValues) {
 		return;
 	}
 	let hasSchema = false;
-	const nodeValues = params[parameterName] as unknown as ResourceMapperValue;
+	// deepCopy so state.paramValue does not share nested references (value, schema,
+	// matchingColumns) with the store's node.parameters. The deepCopy in
+	// emitValueChanged is the intended write-out boundary; this is the matching
+	// read-in boundary that prevents in-place mutations (deleteField, addField,
+	// addAllFields) from leaking into the store before the explicit emit/save path.
 	state.paramValue = {
 		...state.paramValue,
-		...nodeValues,
+		...deepCopy(nodeValues),
 	};
 	if (!state.paramValue.schema) {
 		state.paramValue = {
@@ -178,9 +239,22 @@ onMounted(async () => {
 			matchingColumns: nodeValues.matchingColumns,
 		};
 	}
-	if (!hasSchema) {
+	if (props.isReadOnly) {
+		// A read-only view renders the saved schema as-is. Nothing to fetch or reconcile.
+	} else if (!hasSchema) {
 		// Only fetch a schema if it's not already set
 		await initFetching();
+	} else if (
+		schemaAutoRefreshEnabled &&
+		props.parameter.typeOptions?.resourceMapper?.refreshIncompleteSchemaOnOpen &&
+		isResourceMapperSchemaIncomplete(state.paramValue.schema)
+	) {
+		// Opt-in: the cached schema is structurally incomplete (e.g. authored by
+		// an AI builder rather than loaded from the source), so it would render
+		// with broken/outdated inputs. Reconcile it against the live source
+		// instead. A complete-but-drifted schema falls through to the stale-data
+		// check below, leaving the refresh up to the user.
+		await initFetching(true);
 	} else {
 		await checkStaleFields();
 	}
@@ -276,7 +350,10 @@ const pluralFieldWord = computed<string>(() => {
 	);
 });
 
-async function initFetching(inlineLoading = false): Promise<void> {
+async function initFetching(
+	inlineLoading = false,
+	preFetchedFields?: ResourceMapperFields | null,
+): Promise<void> {
 	state.loadingError = false;
 	if (inlineLoading) {
 		state.refreshInProgress = true;
@@ -284,9 +361,13 @@ async function initFetching(inlineLoading = false): Promise<void> {
 		state.loading = true;
 	}
 	try {
-		await loadAndSetFieldsToMap();
+		await loadAndSetFieldsToMap(preFetchedFields);
 		if (!state.paramValue.matchingColumns || state.paramValue.matchingColumns.length === 0) {
 			onMatchingColumnsChanged(defaultSelectedMatchingColumns.value);
+		}
+		// Set default values after loading schema if value is empty
+		if (!state.paramValue.value || Object.keys(state.paramValue.value).length === 0) {
+			setDefaultFieldValues();
 		}
 		state.hasStaleFields = false;
 	} catch (error) {
@@ -297,7 +378,7 @@ async function initFetching(inlineLoading = false): Promise<void> {
 	}
 }
 
-const createRequestParams = (methodName: string) => {
+const createRequestParams = async (methodName: string) => {
 	if (!props.node) {
 		return;
 	}
@@ -306,34 +387,38 @@ const createRequestParams = (methodName: string) => {
 			name: props.node.type,
 			version: props.node.typeVersion,
 		},
-		currentNodeParameters: resolveRequiredParameters(
+		currentNodeParameters: (await resolveRequiredParameters(
 			props.parameter,
 			props.node.parameters,
-		) as INodeParameters,
+			workflowDocumentStore.value.documentId,
+			expressionLocalResolveCtx?.value ?? {},
+		)) as INodeParameters,
 		path: props.path,
 		methodName,
 		credentials: props.node.credentials,
 		projectId: projectsStore.currentProjectId,
+		workflowId: workflowDocumentStore.value.workflowId,
 	};
 
 	return requestParams;
 };
 
 async function fetchFields(): Promise<ResourceMapperFields | null> {
+	// A read-only view keeps the saved schema; no refresh path may load fields.
+	if (props.isReadOnly) return null;
 	const { resourceMapperMethod, localResourceMapperMethod } =
 		props.parameter.typeOptions?.resourceMapper ?? {};
 
 	let fetchedFields: ResourceMapperFields | null = null;
-
 	if (typeof resourceMapperMethod === 'string') {
-		const requestParams = createRequestParams(
+		const requestParams = (await createRequestParams(
 			resourceMapperMethod,
-		) as ResourceMapperFieldsRequestDto;
+		)) as ResourceMapperFieldsRequestDto;
 		fetchedFields = await nodeTypesStore.getResourceMapperFields(requestParams);
 	} else if (typeof localResourceMapperMethod === 'string') {
-		const requestParams = createRequestParams(
+		const requestParams = (await createRequestParams(
 			localResourceMapperMethod,
-		) as ResourceMapperFieldsRequestDto;
+		)) as ResourceMapperFieldsRequestDto;
 
 		fetchedFields = await nodeTypesStore.getLocalResourceMapperFields(requestParams);
 	}
@@ -343,18 +428,26 @@ async function fetchFields(): Promise<ResourceMapperFields | null> {
 	return fetchedFields;
 }
 
-async function loadAndSetFieldsToMap(): Promise<void> {
+async function loadAndSetFieldsToMap(
+	preFetchedFields?: ResourceMapperFields | null,
+): Promise<void> {
 	if (!props.node) {
 		return;
 	}
 
-	const fetchedFields = await fetchFields();
+	const fetchedFields = preFetchedFields !== undefined ? preFetchedFields : await fetchFields();
 
 	if (fetchedFields !== null) {
 		const newSchema = fetchedFields.fields.map((field) => {
 			const existingField = state.paramValue.schema.find((f) => f.id === field.id);
 			if (existingField) {
-				field.removed = existingField.removed;
+				// Keep the user's removed state, but don't let an incomplete cached
+				// field (e.g. an AI-authored schema missing `removed`) overwrite the
+				// loader-populated value with `undefined`.
+				field.removed =
+					typeof existingField.removed === 'boolean'
+						? existingField.removed
+						: (field.removed ?? false);
 			} else if (state.paramValue.value !== null && !(field.id in state.paramValue.value)) {
 				// New fields are shown by default
 				field.removed = false;
@@ -388,17 +481,11 @@ function setDefaultFieldValues(forceMatchingFieldsUpdate = false): void {
 			if (hideAllFields) {
 				field.removed = !field.required;
 			}
-			if (field.type === 'boolean') {
-				state.paramValue.value = {
-					...state.paramValue.value,
-					[field.id]: false,
-				};
-			} else {
-				state.paramValue.value = {
-					...state.paramValue.value,
-					[field.id]: null,
-				};
-			}
+
+			state.paramValue.value = {
+				...state.paramValue.value,
+				[field.id]: field.removed ? null : getDefaultFieldValue(field),
+			};
 		}
 	});
 	emitValueChanged();
@@ -416,7 +503,7 @@ function updateNodeIssues(): void {
 			nodeType.value,
 		);
 		if (parameterIssues) {
-			ndvStore.updateNodeParameterIssues(parameterIssues);
+			ndvStore.value.updateNodeParameterIssues(parameterIssues);
 		}
 	}
 }
@@ -508,12 +595,10 @@ function addField(name: string): void {
 	const schema = state.paramValue.schema;
 	const field = schema.find((f) => f.id === name);
 
+	const defaultValue = getDefaultFieldValue(field);
 	state.paramValue.value = {
 		...state.paramValue.value,
-		// We only supply boolean defaults since it's a switch that cannot be null in `Fixed` mode
-		// Other defaults may break backwards compatibility as we'd remove the implicit passthrough
-		// mode you get when the field exists, but is empty in `Fixed` mode.
-		[name]: field?.type === 'boolean' ? false : null,
+		[name]: defaultValue,
 	};
 
 	if (field) {
@@ -524,7 +609,7 @@ function addField(name: string): void {
 }
 
 function addAllFields(): void {
-	const newValues: { [name: string]: null } = {};
+	const newValues: Record<string, string | number | boolean | null> = {};
 	state.paramValue.schema.forEach((field) => {
 		if (field.display && field.removed) {
 			newValues[field.id] = null;
@@ -644,9 +729,9 @@ defineExpose({
 			{{ locale.baseText('resourceMapper.staleDataWarning.notice') }}
 			<template #trailingContent>
 				<N8nButton
-					size="mini"
+					variant="outline"
+					size="xsmall"
 					icon="refresh-cw"
-					type="secondary"
 					:loading="state.refreshInProgress"
 					@click="initFetching(true)"
 				>

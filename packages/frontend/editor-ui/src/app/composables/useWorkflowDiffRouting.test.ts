@@ -37,11 +37,38 @@ vi.mock('@n8n/utils/event-bus', () => ({
 	createEventBus: () => mockEventBus,
 }));
 
+const isPromotionsEnabled = ref(false);
+
+vi.mock('@/features/shared/promotions/usePromotionsEnabled', () => ({
+	usePromotionsEnabled: () => ({ isEnabled: isPromotionsEnabled }),
+}));
+
 describe('useWorkflowDiffRouting', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		mockUiStore.modalsById = {};
 		mockRoute.value = { query: {} };
+		isPromotionsEnabled.value = false;
+	});
+
+	it('does not open the v1 push modal from the query while the instance uses Environments v2', () => {
+		isPromotionsEnabled.value = true;
+		mockRoute.value = { query: { sourceControl: 'push' } };
+
+		useWorkflowDiffRouting();
+
+		expect(mockUiStore.openModalWithData).not.toHaveBeenCalled();
+	});
+
+	it('closes an open v1 modal when the instance switches to Environments v2', async () => {
+		mockRoute.value = { query: { sourceControl: 'push' } };
+		useWorkflowDiffRouting();
+		mockUiStore.modalsById[SOURCE_CONTROL_PUSH_MODAL_KEY] = { open: true };
+
+		isPromotionsEnabled.value = true;
+		await nextTick();
+
+		expect(mockUiStore.closeModal).toHaveBeenCalledWith(SOURCE_CONTROL_PUSH_MODAL_KEY);
 	});
 
 	describe('initialization', () => {
@@ -70,6 +97,68 @@ describe('useWorkflowDiffRouting', () => {
 			mockRoute.value.query = {
 				diff: 'workflow-123',
 				direction: 'push',
+			};
+
+			useWorkflowDiffRouting();
+			await nextTick();
+
+			expect(mockUiStore.openModalWithData).toHaveBeenCalledWith({
+				name: WORKFLOW_DIFF_MODAL_KEY,
+				data: {
+					eventBus: mockEventBus,
+					workflowId: 'workflow-123',
+					direction: 'push',
+				},
+			});
+		});
+
+		it('should parse valid workflowStatus query parameter when diff is present', async () => {
+			mockRoute.value.query = {
+				diff: 'workflow-123',
+				direction: 'push',
+				workflowStatus: 'modified',
+			};
+
+			useWorkflowDiffRouting();
+			await nextTick();
+
+			expect(mockUiStore.openModalWithData).toHaveBeenCalledWith({
+				name: WORKFLOW_DIFF_MODAL_KEY,
+				data: {
+					eventBus: mockEventBus,
+					workflowId: 'workflow-123',
+					workflowStatus: 'modified',
+					direction: 'push',
+				},
+			});
+		});
+
+		it('should ignore workflowStatus when diff is not present', async () => {
+			mockRoute.value.query = {
+				direction: 'push',
+				workflowStatus: 'modified',
+			};
+
+			useWorkflowDiffRouting();
+			await nextTick();
+
+			expect(mockUiStore.openModalWithData).toHaveBeenCalledWith({
+				name: SOURCE_CONTROL_PUSH_MODAL_KEY,
+				data: { eventBus: mockEventBus },
+			});
+
+			expect(mockUiStore.openModalWithData).not.toHaveBeenCalledWith(
+				expect.objectContaining({
+					name: WORKFLOW_DIFF_MODAL_KEY,
+				}),
+			);
+		});
+
+		it('should ignore invalid workflowStatus values', async () => {
+			mockRoute.value.query = {
+				diff: 'workflow-123',
+				direction: 'push',
+				workflowStatus: 'invalid-status',
 			};
 
 			useWorkflowDiffRouting();
@@ -168,6 +257,27 @@ describe('useWorkflowDiffRouting', () => {
 				data: {
 					eventBus: mockEventBus,
 					workflowId: 'workflow-456',
+					direction: 'pull',
+				},
+			});
+		});
+
+		it('should include workflowStatus in diff modal data when provided', async () => {
+			mockRoute.value.query = {
+				diff: 'workflow-456',
+				direction: 'pull',
+				workflowStatus: 'created',
+			};
+
+			useWorkflowDiffRouting();
+			await nextTick();
+
+			expect(mockUiStore.openModalWithData).toHaveBeenCalledWith({
+				name: WORKFLOW_DIFF_MODAL_KEY,
+				data: {
+					eventBus: mockEventBus,
+					workflowId: 'workflow-456',
+					workflowStatus: 'created',
 					direction: 'pull',
 				},
 			});
