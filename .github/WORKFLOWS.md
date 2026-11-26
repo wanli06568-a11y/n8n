@@ -181,7 +181,7 @@ These only run if specific files changed:
 | `packages/frontend/@n8n/storybook/**`, design-system, chat             | `release-storybook.yml` | master     |
 | `docs/backend/**`, `packages/@n8n/backend-docs-site/**`                | `release-docs-backend.yml` (PR preview, master deploys to n8n-backend-docs.pages.dev) | master     |
 | `docker/docker-bake.hcl`, `docker/images/n8n-base/Dockerfile`, `docker/images/n8n-base/Dockerfile.debian`, `.github/scripts/docker/base-debian-smoke-check.mjs`, `.github/scripts/docker/bake-inputs-changed.mjs` | `build-base-image.yml` (builds only the bases whose inputs changed; publishes on master only) | any        |
-| `docker/docker-bake.hcl`, `docker/images/node-pc/**`, `.github/scripts/docker/bake-inputs-changed.mjs` | `build-node-pc-image.yml` (builds pointer-compressed Node 26 as `n8nio/node-pc` and stock-configured Node 24 and 26 as `n8nio/node-patched` only when their own inputs changed; publishes from master only; a `workflow_dispatch` on master with `push: true` always builds and publishes all three variants) | any        |
+| `docker/docker-bake.hcl`, `docker/images/node-pc/**`, `.github/scripts/docker/bake-inputs-changed.mjs` | `build-node-pc-image.yml` (builds compiled `-dev` images for pointer-compressed Node 26 as `n8nio/node-pc` and stock-configured Node 24 and 26 as `n8nio/node-patched` only when their own inputs changed; independent of `RUNTIME_IMAGE`; publishes from master only; a `workflow_dispatch` on master with `push: true` always builds and publishes all three variants) | any        |
 | `**/package.json`, `**/turbo.json`                                     | `build-windows.yml`         | master     |
 | `packages/@n8n/ai-workflow-builder.ee/evaluations/programmatic/python/**` | `test-evals-python.yml`  | any        |
 | `packages/quality/efficiency/scale/benchmark/**`                       | `build-benchmark-image.yml` | master     |
@@ -193,8 +193,11 @@ These only run if specific files changed:
 A push to an open PR tests only the commits after the newest PR commit that
 passed `ci-pull-requests.yml`. `find-last-green-commit.mjs` finds that commit.
 `ci-filter` then uses the diff from that commit, not the whole PR, for the path
-filters, the test scoping and the E2E selection. Lint and typecheck still
-compare the whole PR with the base branch.
+filters, the test scoping and the E2E selection. On an incremental run, lint
+and typecheck compare the same commit with the PR head (`TURBO_SCM_BASE` and
+`TURBO_SCM_HEAD`), not with the merge commit, which also holds the base-branch
+changes since that commit. In all other runs, they compare the whole PR with
+the base branch, as before.
 
 `ci-filter` tests the whole PR when one of these is true:
 
@@ -696,7 +699,7 @@ Push to master
 ├─ unit-test (matrix: Node 24.22.2, 26.13.0)
 │   └─ Coverage only on 24.22.2
 ├─ lint
-├─ (performance: CodSpeed benchmarks, paused until the plugin supports Vitest 5)
+├─ performance (CodSpeed benchmarks)
 ├─ verify-single-instance-npm (advisory; packages changed by this push)
 └─ notify-on-failure (Slack #alerts-build)
 ```
@@ -710,6 +713,7 @@ Push to master
 | Hourly :00                | `sec-sync-public-to-private.yml`  | Mirror public → private  |
 | Daily 03:00               | `sec-sync-bundle-branches.yml`    | Merge the base into `bundle/*` |
 | Daily 00:00               | `docker-build-push.yml`           | Nightly Docker images    |
+| After nightly Docker builds | `test-deployment-cells.yml` (`workflow_run`) | Nightly deployment compatibility cells against published `master` and `3.x` images (Currents project `tlfUav`) |
 | Daily 00:00               | `test-db.yml`                     | Database compatibility   |
 | Daily 00:00               | `test-e2e-performance-reusable.yml`| Browser performance and idle memory baselines |
 | Daily 00:00               | `release-storybook.yml`       | Storybook deploy         |
@@ -759,6 +763,13 @@ can promote too via the `force_rc` dispatch input, several times a day: each pub
 claims the next free `v3-rc-<date>.N` as its immutable tag and moves the floating `v3-rc`
 and `v3-rc-<date>` onto it. The counter is derived by probing the registry, and the job
 is serialized on a `v3-rc-tagging` concurrency group so two runs can't claim one number.
+
+`test-deployment-cells.yml` ("Test: Deployment cells") runs via `workflow_run` after
+scheduled `Docker: Build and Push` runs (`master`) and after `Build: v3 Nightly Docker Images`
+runs (`3.x`), and supports manual `workflow_dispatch` with a `channel` selector. It resolves
+and pins the published GHCR image digests, runs API-only Playwright deployment cells in
+`packages/quality/testing/playwright/tests/deployment/` with 0 retries, and reports to the
+separate `n8n-nightly-compatibility` Currents project (`tlfUav`).
 
 See **[`DEVELOPING_V3.md`](./DEVELOPING_V3.md)** for the full model.
 
@@ -905,6 +916,7 @@ Scripts in `.github/scripts/`:
 | `docker/edit-image-native-smoke-check.mjs`| Verify the Edit Image v2 bindings load and draw text with the image's Arial font | `docker-build-smoke.yml`|
 | `docker/native-addons-smoke-check.mjs`| Verify isolated-vm and sqlite3 work in the built image, and that it has no build toolchain | `docker-build-smoke.yml`|
 | `docker/assert-manifest-format.mjs`| Assert a merged manifest is an OCI image index with the expected platforms | `docker-build-push.yml`|
+| `docker/get-manifest-digests.mjs`| Resolve multi-arch manifest digests for attestation and pinned deployment cells | `docker-build-push.yml`, `test-deployment-cells.yml`|
 | `docker/should-smoke-build.mjs`| Narrow the `pnpm-workspace.yaml` smoke trigger to native dependency pins | `docker-build-smoke.yml`|
 | `docker/base-debian-smoke-check.mjs`| Verify the Debian base image contract (tools, no package manager, fonts, global npm modules) on amd64 and arm64 | `build-base-image.yml`|
 | `docker/bake-inputs-changed.mjs`| Decide whether an image must build: compare its resolved bake inputs and Dockerfile between two commits | `build-base-image.yml`, `build-node-pc-image.yml`|
