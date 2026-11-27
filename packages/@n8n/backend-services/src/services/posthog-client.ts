@@ -1,8 +1,6 @@
 import {
 	AGENT_EVALS_FLAG,
 	AGENT_SANDBOX_FILES_FLAG,
-	ASSISTANT_SKILLS_FLAG,
-	CANVAS_NODE_CONTEXT_FLAG,
 	CREDENTIAL_DESCRIPTIONS_FLAG,
 	INSTANCE_AI_NODE_USAGE_FLAG,
 	INSTANCE_AI_CLOUD_BROWSER_FLAG,
@@ -11,10 +9,9 @@ import {
 	EVAL_COLLECTIONS_FLAG,
 	GROUPS_WITH_TRIGGERS_FLAG,
 	GROUPS_WITH_MANY_BOUNDARIES_FLAG,
-	INSTANCE_AI_FOLDER_EXPLORATION_ENABLED_VARIANT,
-	INSTANCE_AI_FOLDER_EXPLORATION_FLAG,
 	KNOWLEDGE_COLLECTIONS_FLAG,
 	SELF_HEALING_FLAG,
+	WORKFLOWS_IN_SKILLS_FLAG,
 } from '@n8n/api-types';
 import { getN8nVersion } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
@@ -34,12 +31,14 @@ const POSTHOG_GROUP_TYPE_INSTANCE = 'company';
 const FLAGS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const EDITOR_INSTANCE_FLAGS = [
 	CREDENTIAL_DESCRIPTIONS_FLAG,
-	ASSISTANT_SKILLS_FLAG,
 	AGENT_SANDBOX_FILES_FLAG,
 	INSTANCE_AI_CLOUD_BROWSER_FLAG,
 	KNOWLEDGE_COLLECTIONS_FLAG,
 	SELF_HEALING_FLAG,
+	WORKFLOWS_IN_SKILLS_FLAG,
 ];
+
+const MULTIVARIATE_EDITOR_INSTANCE_FLAGS = [WORKFLOWS_IN_SKILLS_FLAG];
 
 const SESSION_ID_MAX_LENGTH = 1000;
 
@@ -217,7 +216,12 @@ export class PostHogClient {
 			featureFlags: {
 				...overridden.featureFlags,
 				...Object.fromEntries(
-					EDITOR_INSTANCE_FLAGS.map((flag) => [flag, instanceFlags[flag] === true]),
+					EDITOR_INSTANCE_FLAGS.map((flag) => [
+						flag,
+						MULTIVARIATE_EDITOR_INSTANCE_FLAGS.includes(flag)
+							? (instanceFlags[flag] ?? false)
+							: instanceFlags[flag] === true,
+					]),
 				),
 			},
 		};
@@ -291,17 +295,8 @@ export class PostHogClient {
 			overrides[AGENT_EVALS_FLAG] = true;
 		}
 
-		if (this.globalConfig.instanceAi.canvasNodeContextEnabled) {
-			overrides[CANVAS_NODE_CONTEXT_FLAG] = true;
-		}
-
 		if (this.globalConfig.instanceAi.nodeUsageEnabled) {
 			overrides[INSTANCE_AI_NODE_USAGE_FLAG] = true;
-		}
-
-		if (this.globalConfig.instanceAi.folderExplorationEnabled) {
-			overrides[INSTANCE_AI_FOLDER_EXPLORATION_FLAG] =
-				INSTANCE_AI_FOLDER_EXPLORATION_ENABLED_VARIANT;
 		}
 
 		if (this.globalConfig.workflows.groupsWithTriggersEnabled) {

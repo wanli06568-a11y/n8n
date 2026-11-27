@@ -1,11 +1,10 @@
 import {
 	AGENT_SANDBOX_FILES_FLAG,
-	ASSISTANT_SKILLS_FLAG,
 	CREDENTIAL_DESCRIPTIONS_FLAG,
-	INSTANCE_ACTIVITY_CONTEXT_FLAG,
 	INSTANCE_AI_CLOUD_BROWSER_FLAG,
 	KNOWLEDGE_COLLECTIONS_FLAG,
 	SELF_HEALING_FLAG,
+	WORKFLOWS_IN_SKILLS_FLAG,
 } from '@n8n/api-types';
 import { setN8nVersion } from '@n8n/backend-common';
 import { mockInstance } from '@n8n/backend-test-utils';
@@ -73,22 +72,23 @@ describe('PostHog', () => {
 	});
 
 	describe('getFeatureFlagForInstance', () => {
+		// Any flag outside the batched editor instance flags.
+		const INSTANCE_FLAG = '000_test_instance_flag';
+
 		afterEach(() => {
 			globalConfig.featureFlags.override = {};
 		});
 
 		it('evaluates the flag with the instance group and no user properties', async () => {
 			(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(
-				mockEvaluatedFlags({ [INSTANCE_ACTIVITY_CONTEXT_FLAG]: true }),
+				mockEvaluatedFlags({ [INSTANCE_FLAG]: true }),
 			);
 			const ph = new PostHogClient(instanceSettings, globalConfig);
 			await ph.init();
 
-			await expect(ph.getFeatureFlagForInstance(INSTANCE_ACTIVITY_CONTEXT_FLAG)).resolves.toBe(
-				true,
-			);
+			await expect(ph.getFeatureFlagForInstance(INSTANCE_FLAG)).resolves.toBe(true);
 			expect(PostHog.prototype.evaluateFlags).toHaveBeenCalledWith(`company_${instanceId}`, {
-				flagKeys: [INSTANCE_ACTIVITY_CONTEXT_FLAG],
+				flagKeys: [INSTANCE_FLAG],
 				groups: { company: instanceId },
 			});
 		});
@@ -98,46 +98,38 @@ describe('PostHog', () => {
 			const ph = new PostHogClient(instanceSettings, globalConfig);
 			await ph.init();
 
-			await expect(
-				ph.getFeatureFlagForInstance(INSTANCE_ACTIVITY_CONTEXT_FLAG),
-			).resolves.toBeUndefined();
+			await expect(ph.getFeatureFlagForInstance(INSTANCE_FLAG)).resolves.toBeUndefined();
 		});
 
 		it.each([true, false])(
 			'lets a feature flag override set the instance flag to %s',
 			async (enabled) => {
-				globalConfig.featureFlags.override = { [INSTANCE_ACTIVITY_CONTEXT_FLAG]: enabled };
+				globalConfig.featureFlags.override = { [INSTANCE_FLAG]: enabled };
 				(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(
-					mockEvaluatedFlags({ [INSTANCE_ACTIVITY_CONTEXT_FLAG]: !enabled }),
+					mockEvaluatedFlags({ [INSTANCE_FLAG]: !enabled }),
 				);
 				const ph = new PostHogClient(instanceSettings, globalConfig);
 				await ph.init();
 
-				await expect(ph.getFeatureFlagForInstance(INSTANCE_ACTIVITY_CONTEXT_FLAG)).resolves.toBe(
-					enabled,
-				);
+				await expect(ph.getFeatureFlagForInstance(INSTANCE_FLAG)).resolves.toBe(enabled);
 			},
 		);
 
 		it('applies local overrides when diagnostics are disabled', async () => {
 			globalConfig.diagnostics.enabled = false;
-			globalConfig.featureFlags.override = { [INSTANCE_ACTIVITY_CONTEXT_FLAG]: true };
+			globalConfig.featureFlags.override = { [INSTANCE_FLAG]: true };
 			const ph = new PostHogClient(instanceSettings, globalConfig);
 			await ph.init();
 
-			await expect(ph.getFeatureFlagForInstance(INSTANCE_ACTIVITY_CONTEXT_FLAG)).resolves.toBe(
-				true,
-			);
-			globalConfig.featureFlags.override = { [INSTANCE_ACTIVITY_CONTEXT_FLAG]: false };
-			await expect(ph.getFeatureFlagForInstance(INSTANCE_ACTIVITY_CONTEXT_FLAG)).resolves.toBe(
-				false,
-			);
+			await expect(ph.getFeatureFlagForInstance(INSTANCE_FLAG)).resolves.toBe(true);
+			globalConfig.featureFlags.override = { [INSTANCE_FLAG]: false };
+			await expect(ph.getFeatureFlagForInstance(INSTANCE_FLAG)).resolves.toBe(false);
 			expect(PostHog.prototype.evaluateFlags).not.toHaveBeenCalled();
 		});
 
 		it('skips PostHog on an eval instance and still applies overrides', async () => {
 			globalConfig.instanceAi.evalInstance = true;
-			globalConfig.featureFlags.override = { '110_instance_ai_folder_exploration': 'test' };
+			globalConfig.featureFlags.override = { '000_test_flag': 'test' };
 			const ph = new PostHogClient(instanceSettings, globalConfig);
 			await ph.init();
 
@@ -145,7 +137,7 @@ describe('PostHog', () => {
 
 			expect(PostHog.prototype.constructor).not.toHaveBeenCalled();
 			expect(PostHog.prototype.evaluateFlags).not.toHaveBeenCalled();
-			expect(flags['110_instance_ai_folder_exploration']).toBe('test');
+			expect(flags['000_test_flag']).toBe('test');
 			globalConfig.instanceAi.evalInstance = false;
 			globalConfig.featureFlags.override = {};
 		});
@@ -240,7 +232,6 @@ describe('PostHog', () => {
 				(PostHog.prototype.evaluateFlags as Mock).mockImplementation(async (distinctId: string) =>
 					mockEvaluatedFlags({
 						[CREDENTIAL_DESCRIPTIONS_FLAG]: distinctId === `company_${instanceId}`,
-						[ASSISTANT_SKILLS_FLAG]: distinctId === `company_${instanceId}`,
 						[AGENT_SANDBOX_FILES_FLAG]: distinctId === `company_${instanceId}`,
 						[INSTANCE_AI_CLOUD_BROWSER_FLAG]: distinctId === `company_${instanceId}`,
 						[KNOWLEDGE_COLLECTIONS_FLAG]: distinctId === `company_${instanceId}`,
@@ -250,18 +241,16 @@ describe('PostHog', () => {
 				await ph.init();
 
 				if (firstReader === 'backend') {
-					expect(await ph.getFeatureFlagForInstance(ASSISTANT_SKILLS_FLAG)).toBe(true);
+					expect(await ph.getFeatureFlagForInstance(AGENT_SANDBOX_FILES_FLAG)).toBe(true);
 				}
 				for (const id of ['user-1', 'user-2']) {
 					const flags = await ph.getFeatureFlags({ id, createdAt });
 					expect(flags[CREDENTIAL_DESCRIPTIONS_FLAG]).toBe(true);
-					expect(flags[ASSISTANT_SKILLS_FLAG]).toBe(true);
 					expect(flags[AGENT_SANDBOX_FILES_FLAG]).toBe(true);
 					expect(flags[INSTANCE_AI_CLOUD_BROWSER_FLAG]).toBe(true);
 					expect(flags[KNOWLEDGE_COLLECTIONS_FLAG]).toBe(true);
 				}
 				expect(await ph.getFeatureFlagForInstance(CREDENTIAL_DESCRIPTIONS_FLAG)).toBe(true);
-				expect(await ph.getFeatureFlagForInstance(ASSISTANT_SKILLS_FLAG)).toBe(true);
 				expect(await ph.getFeatureFlagForInstance(AGENT_SANDBOX_FILES_FLAG)).toBe(true);
 				expect(await ph.getFeatureFlagForInstance(INSTANCE_AI_CLOUD_BROWSER_FLAG)).toBe(true);
 				expect(await ph.getFeatureFlagForInstance(KNOWLEDGE_COLLECTIONS_FLAG)).toBe(true);
@@ -270,11 +259,11 @@ describe('PostHog', () => {
 					groups: { company: instanceId },
 					flagKeys: [
 						CREDENTIAL_DESCRIPTIONS_FLAG,
-						ASSISTANT_SKILLS_FLAG,
 						AGENT_SANDBOX_FILES_FLAG,
 						INSTANCE_AI_CLOUD_BROWSER_FLAG,
 						KNOWLEDGE_COLLECTIONS_FLAG,
 						SELF_HEALING_FLAG,
+						WORKFLOWS_IN_SKILLS_FLAG,
 					],
 				});
 			},
@@ -290,9 +279,9 @@ describe('PostHog', () => {
 								? {}
 								: {
 										[CREDENTIAL_DESCRIPTIONS_FLAG]: instanceResult,
-										[ASSISTANT_SKILLS_FLAG]: instanceResult,
+										[AGENT_SANDBOX_FILES_FLAG]: instanceResult,
 									}
-							: { [CREDENTIAL_DESCRIPTIONS_FLAG]: true, [ASSISTANT_SKILLS_FLAG]: true },
+							: { [CREDENTIAL_DESCRIPTIONS_FLAG]: true, [AGENT_SANDBOX_FILES_FLAG]: true },
 					),
 				);
 				const ph = new PostHogClient(instanceSettings, globalConfig);
@@ -300,7 +289,7 @@ describe('PostHog', () => {
 
 				const flags = await ph.getFeatureFlags({ id: userId, createdAt });
 				expect(flags[CREDENTIAL_DESCRIPTIONS_FLAG]).toBe(false);
-				expect(flags[ASSISTANT_SKILLS_FLAG]).toBe(false);
+				expect(flags[AGENT_SANDBOX_FILES_FLAG]).toBe(false);
 			},
 		);
 
@@ -334,11 +323,11 @@ describe('PostHog', () => {
 				featureFlags: {
 					...flags,
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 				},
 				featureFlagPayloads: payloads,
 			};
@@ -350,6 +339,26 @@ describe('PostHog', () => {
 				expected,
 			);
 			expect(PostHog.prototype.evaluateFlags).toHaveBeenCalledTimes(2);
+		});
+
+		it('passes the variant of a multivariate instance flag to the editor', async () => {
+			(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(
+				mockEvaluatedFlags({ [WORKFLOWS_IN_SKILLS_FLAG]: 'variant', [SELF_HEALING_FLAG]: true }),
+			);
+
+			const ph = new PostHogClient(instanceSettings, globalConfig);
+			await ph.init();
+
+			const { featureFlags } = await ph.getFeatureFlagsAndPayloads({ id: userId, createdAt });
+
+			expect(featureFlags).toEqual({
+				[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
+				[AGENT_SANDBOX_FILES_FLAG]: false,
+				[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
+				[KNOWLEDGE_COLLECTIONS_FLAG]: false,
+				[SELF_HEALING_FLAG]: true,
+				[WORKFLOWS_IN_SKILLS_FLAG]: 'variant',
+			});
 		});
 
 		it('returns cached flags on second call', async () => {
@@ -365,20 +374,20 @@ describe('PostHog', () => {
 			expect(first).toEqual({
 				...flags,
 				[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-				[ASSISTANT_SKILLS_FLAG]: false,
 				[AGENT_SANDBOX_FILES_FLAG]: false,
 				[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 				[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 				[SELF_HEALING_FLAG]: false,
+				[WORKFLOWS_IN_SKILLS_FLAG]: false,
 			});
 			expect(second).toEqual({
 				...flags,
 				[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-				[ASSISTANT_SKILLS_FLAG]: false,
 				[AGENT_SANDBOX_FILES_FLAG]: false,
 				[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 				[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 				[SELF_HEALING_FLAG]: false,
+				[WORKFLOWS_IN_SKILLS_FLAG]: false,
 			});
 			expect(PostHog.prototype.evaluateFlags).toHaveBeenCalledTimes(2);
 		});
@@ -423,8 +432,6 @@ describe('PostHog', () => {
 				globalConfig.evaluation.collectionsEnabled = false;
 				globalConfig.evaluation.configEvalsEnabled = false;
 				globalConfig.evaluation.agentEvalsEnabled = false;
-				globalConfig.instanceAi.canvasNodeContextEnabled = false;
-				globalConfig.instanceAi.folderExplorationEnabled = false;
 				globalConfig.workflows.groupsWithTriggersEnabled = false;
 				globalConfig.workflows.groupsWithManyBoundariesEnabled = false;
 				globalConfig.featureFlags.override = {};
@@ -452,29 +459,6 @@ describe('PostHog', () => {
 				const flags = await ph.getFeatureFlags({ id: userId, createdAt });
 
 				expect(flags).toMatchObject({ '088_config_evaluations': 'variant' });
-			});
-
-			it('leaves the instance activity flag unset when PostHog has no answer', async () => {
-				(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(mockEvaluatedFlags({}));
-
-				const ph = new PostHogClient(instanceSettings, globalConfig);
-				await ph.init();
-
-				const flags = await ph.getFeatureFlags({ id: userId, createdAt });
-
-				expect(flags['114_instance_activity_context']).toBeUndefined();
-			});
-
-			it('force-enables the folder-exploration flag when N8N_INSTANCE_AI_FOLDER_EXPLORATION_ENABLED is set', async () => {
-				(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(mockEvaluatedFlags({}));
-				globalConfig.instanceAi.folderExplorationEnabled = true;
-
-				const ph = new PostHogClient(instanceSettings, globalConfig);
-				await ph.init();
-
-				const flags = await ph.getFeatureFlags({ id: userId, createdAt });
-
-				expect(flags).toMatchObject({ '110_instance_ai_folder_exploration': 'test' });
 			});
 
 			it('force-enables the groups-with-triggers flag on its own env var', async () => {
@@ -535,11 +519,11 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'some-other-flag': true,
 					'multivariate-flag': 'variant',
 					'boolean-flag': true,
@@ -559,11 +543,11 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'contested-flag': 'variant',
 				});
 			});
@@ -599,11 +583,11 @@ describe('PostHog', () => {
 				expect(data).toEqual({
 					featureFlags: {
 						[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-						[ASSISTANT_SKILLS_FLAG]: false,
 						[AGENT_SANDBOX_FILES_FLAG]: false,
 						[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 						[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 						[SELF_HEALING_FLAG]: false,
+						[WORKFLOWS_IN_SKILLS_FLAG]: false,
 						'value-only-flag': 'variant',
 						'payload-flag': 'variant',
 						'untouched-flag': true,
@@ -630,11 +614,11 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'live-flag': false,
 				});
 			});
@@ -666,11 +650,11 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'some-other-flag': true,
 				});
 			});
@@ -686,11 +670,11 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'084_eval_collections': true,
 				});
 			});
@@ -718,48 +702,12 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'101_agent_evals': true,
-				});
-			});
-
-			it('force-enables the canvas-node-context flag when N8N_INSTANCE_AI_NODE_CONTEXT_ENABLED is set', async () => {
-				(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(mockEvaluatedFlags({}));
-
-				globalConfig.instanceAi.canvasNodeContextEnabled = true;
-
-				const ph = new PostHogClient(instanceSettings, globalConfig);
-				await ph.init();
-
-				const flags = await ph.getFeatureFlags({ id: userId, createdAt });
-
-				expect(flags).toMatchObject({ '104_canvas_aia_node_context': true });
-			});
-
-			it('leaves the canvas-node-context flag untouched when the override is off', async () => {
-				(PostHog.prototype.evaluateFlags as Mock).mockResolvedValue(
-					mockEvaluatedFlags({ '104_canvas_aia_node_context': true }),
-				);
-
-				globalConfig.instanceAi.canvasNodeContextEnabled = false;
-
-				const ph = new PostHogClient(instanceSettings, globalConfig);
-				await ph.init();
-
-				const flags = await ph.getFeatureFlags({ id: userId, createdAt });
-
-				expect(flags).toEqual({
-					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
-					[AGENT_SANDBOX_FILES_FLAG]: false,
-					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
-					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
-					[SELF_HEALING_FLAG]: false,
-					'104_canvas_aia_node_context': true,
 				});
 			});
 
@@ -769,7 +717,6 @@ describe('PostHog', () => {
 				globalConfig.evaluation.collectionsEnabled = true;
 				globalConfig.evaluation.configEvalsEnabled = true;
 				globalConfig.evaluation.agentEvalsEnabled = true;
-				globalConfig.instanceAi.canvasNodeContextEnabled = true;
 
 				const ph = new PostHogClient(instanceSettings, globalConfig);
 				await ph.init();
@@ -778,15 +725,14 @@ describe('PostHog', () => {
 
 				expect(flags).toEqual({
 					[CREDENTIAL_DESCRIPTIONS_FLAG]: false,
-					[ASSISTANT_SKILLS_FLAG]: false,
 					[AGENT_SANDBOX_FILES_FLAG]: false,
 					[INSTANCE_AI_CLOUD_BROWSER_FLAG]: false,
 					[KNOWLEDGE_COLLECTIONS_FLAG]: false,
 					[SELF_HEALING_FLAG]: false,
+					[WORKFLOWS_IN_SKILLS_FLAG]: false,
 					'084_eval_collections': true,
 					'088_config_evaluations': 'variant',
 					'101_agent_evals': true,
-					'104_canvas_aia_node_context': true,
 				});
 			});
 		});
