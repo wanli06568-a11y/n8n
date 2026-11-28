@@ -97,7 +97,7 @@ import {
 import { buildFixWithAiPrompt } from '../fixWithAi';
 import { formatAgentPreviewContextLabel } from '../instanceAi.handoffContext';
 import { useInstanceAiStore } from '../instanceAi.store';
-import { getAppTargetsFromThreadMetadata, threadTargetsAgent } from '../instanceAi.threadRuntime';
+import { getAppTargetsFromThreadMetadata } from '../instanceAi.threadRuntime';
 import { useInstanceAiSettingsStore } from '../instanceAiSettings.store';
 import { buildThreadArtifactsContext, createDisplayedExecutionReader } from '../threadArtifacts';
 import { isArtifactTab, isSavedArtifactTab, useCanvasPreview } from '../useCanvasPreview';
@@ -428,7 +428,11 @@ const activeArtifactId = ref<string>();
 
 // The preview shows the subject of a new thread until the server has its bindings, which the
 // first message writes. Only a saved resource: a pending one needs a thread that the server knows.
-const launchSubject = launch?.subject?.pending ? undefined : launch?.subject;
+// The MCP server subject has no pending state, so the check narrows the union first.
+const launchSubject =
+	launch?.subject && 'pending' in launch.subject && launch.subject.pending
+		? undefined
+		: launch?.subject;
 const projectAndName = ({ projectId, name }: { projectId: string; name?: string }) => ({
 	projectId,
 	...(name ? { name } : {}),
@@ -1176,11 +1180,7 @@ function updateStagedNodes(attachment: InstanceAiNodesAttachment): void {
 								:project-id="props.projectId"
 								@attach-files="panel?.openFilePicker()"
 							/>
-							<!-- A thread that builds an agent always runs in Manual mode. -->
-							<ApprovalModeSelector
-								v-if="!threadTargetsAgent(threadsStore.threadsById.get(props.threadId)?.metadata)"
-								:thread-id="props.threadId"
-							/>
+							<ApprovalModeSelector :thread-id="props.threadId" />
 						</template>
 					</AgentChatPanel>
 				</div>

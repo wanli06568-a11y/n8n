@@ -56,6 +56,7 @@ import { redactTelemetryText, TELEMETRY_EVENT } from '@n8n/telemetry';
 import { Container, Service } from '@n8n/di';
 import type {
 	InstanceAiAppService,
+	InstanceAiCustomMcpServerService,
 	InstanceAiContext,
 	InstanceAiConversationHistoryReader,
 	InstanceAiWorkflowService,
@@ -211,11 +212,12 @@ import {
 	type AgentCredentialProvider,
 } from './eval/scoped-credential-provider';
 import { InstanceAiBuilderDelegateAdapterService } from './instance-ai-builder-delegate.adapter';
+import { InstanceAiCustomMcpServersAdapterService } from './instance-ai-custom-mcp-servers.adapter';
 import { InstanceAiSkillsAdapterService } from './instance-ai-skills.adapter';
 import type { AssistantCredentialTestTarget } from './turn-setup/assistant-turn-overrides';
 import { DataTableRepository, DataTableService } from '@n8n/backend-module-data-table';
 
-import { SkillsGate, SkillSyncFlagGate } from '@/modules/skills';
+import { SkillsGate, SkillSyncFlagGate, WorkflowsInSkillsFlagGate } from '@/modules/skills';
 import {
 	MCP_REGISTRY_PACKAGE_NAME,
 	getMcpRegistryCredentialOptions,
@@ -454,7 +456,10 @@ export interface InstanceAiFeatureFlags {
 	instanceContextEnabled: boolean;
 	assistantSkillsEnabled: boolean;
 	skillSourcesEnabled?: boolean;
+	workflowsInSkillsEnabled?: boolean;
 	preferencesNoteVariant?: string;
+	/** Custom MCP servers: only the variant `test` of the flag turns them on. */
+	customMcpServersEnabled: boolean;
 }
 
 const AGENT_FEEDBACK_SUMMARY_MAX_LENGTH = 1000;
@@ -608,6 +613,9 @@ export class InstanceAiAdapterService {
 			credentialDescriptionsEnabled?: boolean;
 			assistantSkillsEnabled?: boolean;
 			skillSourcesEnabled?: boolean;
+			/** Falsy → the custom MCP servers service and tool are not wired. */
+			customMcpServersEnabled?: boolean;
+			workflowsInSkillsEnabled?: boolean;
 			/** Host-resolved main model for the run. */
 			modelId?: ModelConfig;
 			/** Host-resolved utility model. Absent → utility calls use `modelId`. */
@@ -642,6 +650,8 @@ export class InstanceAiAdapterService {
 			credentialDescriptionsEnabled,
 			assistantSkillsEnabled,
 			skillSourcesEnabled,
+			customMcpServersEnabled,
+			workflowsInSkillsEnabled,
 			modelId,
 			utilityModelId,
 			onHelperUsage,
@@ -740,8 +750,12 @@ export class InstanceAiAdapterService {
 				user,
 				assistantSkillsEnabled === true,
 				skillSourcesEnabled,
+				workflowsInSkillsEnabled,
 			),
 			appService: this.createAppAdapter(user, projectId, threadId),
+			...(customMcpServersEnabled === true
+				? { customMcpServerService: this.createCustomMcpServerAdapter(user, projectId, threadId) }
+				: {}),
 			webResearchService: this.createWebResearchAdapter(user, searchProxyConfig),
 			workspaceService: this.createWorkspaceAdapter(user, projectId),
 			workflowTemplateService: this.createWorkflowTemplateAdapter(),
@@ -802,6 +816,7 @@ export class InstanceAiAdapterService {
 		user: User,
 		assistantSkillsEnabled: boolean,
 		skillSourcesEnabled?: boolean,
+		workflowsInSkillsEnabled?: boolean,
 	): InstanceAiSkillService | undefined {
 		try {
 			if (!Container.get(SkillsGate).isEnabled) return undefined;
@@ -809,6 +824,7 @@ export class InstanceAiAdapterService {
 				user,
 				assistantSkillsEnabled,
 				skillSourcesEnabled,
+				workflowsInSkillsEnabled,
 			);
 		} catch (error) {
 			this.logger.warn('Failed to resolve the skills adapter; skill tools disabled', {
@@ -854,12 +870,33 @@ export class InstanceAiAdapterService {
 		}
 	}
 
+	/**
+	 * Reads the flag for the instance, as the server routes do. So the tool is in the chat only
+	 * when its calls can work.
+	 */
+	private async isCustomMcpServersEnabled(): Promise<boolean> {
+		try {
+			if (!Container.get(ModuleRegistry).isActive('mcp-servers')) return false;
+			const { CustomMcpServersFlagGate } = await import('@n8n/backend-module-mcp-servers');
+			return await Container.get(CustomMcpServersFlagGate).isEnabled();
+		} catch {
+			return false;
+		}
+	}
+
 	/** Resolves experiment assignments. */
 	async resolveExperimentGates(user: User): Promise<InstanceAiFeatureFlags> {
 		let flags: Awaited<ReturnType<PostHogClient['getFeatureFlags']>> = {};
 		let skillSourcesEnabled = false;
+		let workflowsInSkillsEnabled = false;
 		try {
-			flags = await Container.get(PostHogClient).getFeatureFlags(user);
+			const [userFlags, workflowsInSkillsFlag] = await Promise.allSettled([
+				Container.get(PostHogClient).getFeatureFlags(user),
+				(async () => await Container.get(WorkflowsInSkillsFlagGate).isEnabled())(),
+			]);
+			if (userFlags.status === 'fulfilled') flags = userFlags.value;
+			workflowsInSkillsEnabled =
+				workflowsInSkillsFlag.status === 'fulfilled' && workflowsInSkillsFlag.value;
 			// Reuse the assignments already fetched for this turn.
 			skillSourcesEnabled = Container.get(SkillSyncFlagGate).isEnabledForFlags(flags);
 		} catch {
@@ -886,9 +923,11 @@ export class InstanceAiAdapterService {
 			nodeContextEnabled: true,
 			folderExplorationEnabled: true,
 			approvalModesEnabled: flags[INSTANCE_AI_APPROVAL_MODES_FLAG] === true,
+			customMcpServersEnabled: await this.isCustomMcpServersEnabled(),
 			instanceContextEnabled: this.globalConfig.activityLog.enabled,
 			assistantSkillsEnabled: true,
 			...(skillSourcesEnabled ? { skillSourcesEnabled } : {}),
+			...(workflowsInSkillsEnabled ? { workflowsInSkillsEnabled } : {}),
 			...(typeof preferencesNoteVariant === 'string' ? { preferencesNoteVariant } : {}),
 		};
 	}
@@ -3895,6 +3934,18 @@ export class InstanceAiAdapterService {
 				return await sources.exportSdk();
 			},
 		};
+	}
+
+	private createCustomMcpServerAdapter(
+		user: User,
+		projectId?: string,
+		threadId?: string,
+	): InstanceAiCustomMcpServerService | undefined {
+		const access = this.createProjectScopeHelpers(user, projectId);
+		return Container.get(InstanceAiCustomMcpServersAdapterService).createService(user, {
+			threadId,
+			access,
+		});
 	}
 
 	private createDataTableAdapter(user: User, boundProjectId?: string): InstanceAiDataTableService {

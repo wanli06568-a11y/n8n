@@ -28,7 +28,15 @@ import type {
 	AppBuildResponse,
 	AppListResponse,
 	AppResponse,
+	McpServerDetailResponse,
+	McpServerResponse,
+	McpServerToolCandidate,
+	McpServerToolDraftField,
+	McpServerToolDraftResponse,
+	McpServerToolResponse,
 	SaveSkillDto,
+	UpdateMcpServerDto,
+	UpdateMcpServerToolDto,
 	SkillDetail,
 	SkillListResponse,
 	SkillSaveResponse,
@@ -1277,6 +1285,7 @@ export interface InstanceAiAgentFeedbackService {
 
 export interface InstanceAiSkillService {
 	assistantSkillsEnabled: boolean;
+	workflowsInSkillsEnabled?: boolean;
 	sources?: {
 		list(): Promise<SkillSourceListItem[]>;
 		discover(input: DiscoverPublicSkillSource): Promise<PublicSkillSourceDiscovery>;
@@ -1383,6 +1392,97 @@ export interface InstanceAiAppService {
 	): Promise<AppBindingsResponse & { types: string }>;
 	/** The `@n8n/app-sdk` package of this instance as a gzip tar archive. */
 	exportSdk(): Promise<Buffer>;
+}
+
+// ── Custom MCP servers ──────────────────────────────────────────────────────
+
+/**
+ * One server of a project. Without `projectId`, the adapter uses the project of the
+ * conversation, or else the personal project of the user.
+ */
+export interface CustomMcpServerRef {
+	serverId: string;
+	projectId?: string;
+}
+
+export interface CustomMcpServerCandidateQuery {
+	/** Only workflows whose name or description contains this text, in any case. */
+	query?: string;
+	limit: number;
+	includeUnusable?: boolean;
+}
+
+export interface CustomMcpServerCandidatePage {
+	candidates: McpServerToolCandidate[];
+	/** Checked workflows that are not in `candidates`, because they cannot be a tool. */
+	unusable: number;
+	/** `true` when the page stopped at the limit, and at least one more workflow fits. */
+	more: boolean;
+}
+
+/**
+ * The builder actions on custom MCP servers. The adapter calls the same module services as the
+ * REST API, with the same project scopes, and marks each event with the source "assistant".
+ */
+export interface InstanceAiCustomMcpServerService {
+	/** The servers of one project, or of every project that the user can list. */
+	list(projectId?: string): Promise<McpServerResponse[]>;
+	/** One server with its tools. It checks every tool, so a card reads `getServer` or `getTool`. */
+	get(ref: CustomMcpServerRef): Promise<McpServerDetailResponse>;
+	/** One server, without its tools. */
+	getServer(ref: CustomMcpServerRef): Promise<McpServerResponse>;
+	/** One tool with its server. It checks only this tool. */
+	getTool(
+		ref: CustomMcpServerRef,
+		toolId: string,
+	): Promise<{
+		server: McpServerResponse;
+		tool: McpServerToolResponse;
+		toolDraftsAvailable: boolean;
+	}>;
+	/** The names of these workflows of the project, for an approval card. */
+	workflowNames(
+		ref: CustomMcpServerRef,
+		workflowIds: string[],
+	): Promise<Array<{ workflowId: string; name: string }>>;
+	/**
+	 * Throws when the user cannot make this change in the project, or when a conversation bound
+	 * to a project writes to another project. The tool calls it before it shows a card.
+	 */
+	assertCanWrite(
+		projectId: string | undefined,
+		change: 'create' | 'update' | 'delete',
+	): Promise<void>;
+	create(input: {
+		projectId?: string;
+		name: string;
+		/** Without a slug, the adapter makes one from the name. */
+		slug?: string;
+		description?: string;
+	}): Promise<McpServerResponse>;
+	update(ref: CustomMcpServerRef, changes: UpdateMcpServerDto): Promise<McpServerResponse>;
+	delete(ref: CustomMcpServerRef): Promise<void>;
+	/**
+	 * The first workflows of the project in name order, up to `limit`. Without
+	 * `includeUnusable`, only the workflows that can be a tool.
+	 */
+	listToolCandidates(
+		ref: CustomMcpServerRef,
+		options: CustomMcpServerCandidateQuery,
+	): Promise<CustomMcpServerCandidatePage>;
+	addTools(ref: CustomMcpServerRef, workflowIds: string[]): Promise<McpServerToolResponse[]>;
+	updateTool(
+		ref: CustomMcpServerRef,
+		toolId: string,
+		changes: UpdateMcpServerToolDto,
+	): Promise<McpServerToolResponse>;
+	/** "Generate": an AI draft of one field, or of both fields without `field`. */
+	generateTool(
+		ref: CustomMcpServerRef,
+		toolId: string,
+		field?: McpServerToolDraftField,
+	): Promise<McpServerToolDraftResponse>;
+	removeTool(ref: CustomMcpServerRef, toolId: string): Promise<void>;
 }
 
 // ── Evaluation configs (config-based evals) ──────────────────────────────────
@@ -1739,6 +1839,12 @@ type WithResolvedAgentId<T> = T extends { agentId?: string }
 
 export type AgentContextLookup = WithResolvedAgentId<AgentContextInput>;
 
+/** Agent archive operations bound to one user and project. */
+export interface InstanceAiAgentArchiveService {
+	preview(agentId: string): Promise<{ name: string }>;
+	archive(agentId: string): Promise<{ name: string }>;
+}
+
 /** Read-only Agent context. The host binds this reader to one user and project. */
 export interface InstanceAiAgentContextReader {
 	lookup(input: AgentContextLookup): Promise<Record<string, unknown>>;
@@ -1880,6 +1986,8 @@ export interface InstanceAiContext {
 	conversationHistoryService?: InstanceAiConversationHistoryReader;
 	/** Present when the user can read Agents in the bound project. */
 	agentContextService?: InstanceAiAgentContextReader;
+	/** Present when the user can archive Agents in the bound project. */
+	agentArchiveService?: InstanceAiAgentArchiveService;
 	/** Present only when the instance-context reader is enabled; its absence hides the tool. */
 	activityService?: InstanceAiActivityService;
 	/** Present only when saved preferences are enabled for this user; its
@@ -1889,6 +1997,8 @@ export interface InstanceAiContext {
 	agentFeedbackService?: InstanceAiAgentFeedbackService;
 	skillService?: InstanceAiSkillService;
 	appService?: InstanceAiAppService;
+	/** Present when custom MCP servers are on for the user; its absence hides the tool. */
+	customMcpServerService?: InstanceAiCustomMcpServerService;
 	/** Per-run inventory behind `mcp-servers`' `connected` action. Captured when the
 	 *  agent is built, which is also when its MCP tools are attached, so it always
 	 *  matches what this agent can actually call. */
